@@ -22,7 +22,7 @@ import {
 // Payload archive served by feed bots' broadcast_helper.py. Key is the
 // SHA-256 hash committed on-chain → files named {hash}.json (no 0x prefix).
 const PAYLOAD_ARCHIVE_DIR =
-  process.env.PAYLOAD_ARCHIVE_DIR || "/home/orkz/byte/data-feeds/archive";
+  process.env.PAYLOAD_ARCHIVE_DIR || "../data-feeds/archive";
 
 const app = express();
 app.use(cors());
