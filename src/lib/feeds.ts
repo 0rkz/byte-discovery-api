@@ -3,7 +3,7 @@
  *
  * Enumerates data feed publishers from the Byte Protocol indexer (preferred)
  * or falls back to on-chain enumeration via DataRegistry. Each feed is
- * enriched with PQS scores, subscriber counts, and attestation summaries.
+ * enriched with PQS scores, schema metadata, and attestation summaries.
  */
 
 import { createPublicClient, http } from "viem";
@@ -13,8 +13,9 @@ import {
   contracts,
   PQSVerifierABI,
   DataRegistryABI,
-  DataStreamABI,
-} from "./config";
+  SchemaRegistryABI,
+  TIER_NAMES,
+} from "./config.js";
 
 /** Viem public client for Arbitrum Sepolia on-chain reads. */
 const client = createPublicClient({
@@ -26,11 +27,10 @@ const client = createPublicClient({
 export interface Feed {
   publisher: string;
   topic: string;
-  description: string;
   tier: string;
-  pqs: number;
-  pricePerKB: number;
-  frequency: number;
+  pqs: number; // composite, 0-10000 BPS
+  pricePerKB: number; // µUSDC (6 decimals)
+  frequencySeconds: number;
   subscribers: number;
   messages: number;
   attestations: { positive: number; negative: number; total: number };
@@ -58,6 +58,27 @@ export interface DiscoveryResponse {
   };
 }
 
+/**
+ * Decode a bytes32 hex value to a printable topic string. Schemas store
+ * topics as ASCII padded with null bytes. If the bytes don't decode to
+ * printable ASCII (e.g., the value is a hash or random bytes), fall back
+ * to "data-feed".
+ */
+function decodeTopic(hex: string): string {
+  if (!hex || typeof hex !== "string") return "data-feed";
+  const bytes = hex.replace(/^0x/, "");
+  let str = "";
+  for (let i = 0; i < bytes.length; i += 2) {
+    const code = parseInt(bytes.substr(i, 2), 16);
+    if (Number.isNaN(code)) return "data-feed";
+    if (code === 0) break;
+    str += String.fromCharCode(code);
+  }
+  if (str.length < 2 || str.length > 31) return "data-feed";
+  if (!/^[a-zA-Z0-9._\-: ]+$/.test(str)) return "data-feed";
+  return str;
+}
+
 /** Fetch JSON from the Byte indexer, returning null on any failure. */
 async function fetchFromIndexer(path: string): Promise<any> {
   try {
@@ -69,77 +90,84 @@ async function fetchFromIndexer(path: string): Promise<any> {
   }
 }
 
-/** Read all publisher metadata from on-chain contracts in a single parallel batch. */
+/**
+ * Read a publisher's full state by joining DataRegistry, SchemaRegistry, and
+ * PQSVerifier in parallel. Returns null if the publisher's core record can't
+ * be read; individual missing pieces (schema, PQS) get safe defaults.
+ */
 async function getOnChainPublisherData(publisher: `0x${string}`): Promise<{
+  status: number;
+  tier: string;
   topic: string;
-  description: string;
   pricePerKB: number;
-  frequency: number;
+  frequencySeconds: number;
   active: boolean;
   pqs: number;
-  tier: string;
   subscribers: number;
   messages: number;
 } | null> {
   try {
-    const [info, score, tier, subscribers, messages] = await Promise.allSettled([
+    const [pubResult, schemaResult, pqsResult] = await Promise.allSettled([
       client.readContract({
         address: contracts.DataRegistry,
         abi: DataRegistryABI,
-        functionName: "getPublisherInfo",
+        functionName: "getPublisher",
+        args: [publisher],
+      }),
+      client.readContract({
+        address: contracts.SchemaRegistry,
+        abi: SchemaRegistryABI,
+        functionName: "getSchema",
         args: [publisher],
       }),
       client.readContract({
         address: contracts.PQSVerifier,
         abi: PQSVerifierABI,
-        functionName: "getPublisherScore",
-        args: [publisher],
-      }),
-      client.readContract({
-        address: contracts.PQSVerifier,
-        abi: PQSVerifierABI,
-        functionName: "getPublisherTier",
-        args: [publisher],
-      }),
-      client.readContract({
-        address: contracts.DataStream,
-        abi: DataStreamABI,
-        functionName: "getSubscriberCount",
-        args: [publisher],
-      }),
-      client.readContract({
-        address: contracts.DataStream,
-        abi: DataStreamABI,
-        functionName: "getMessageCount",
+        functionName: "getVerifiedPQS",
         args: [publisher],
       }),
     ]);
 
-    const infoResult = info.status === "fulfilled" ? (info.value as any) : null;
-    const scoreResult =
-      score.status === "fulfilled" ? Number(score.value) : 10000;
-    const tierResult =
-      tier.status === "fulfilled" ? (tier.value as string) : "New";
-    const subsResult =
-      subscribers.status === "fulfilled" ? Number(subscribers.value) : 0;
-    const msgsResult =
-      messages.status === "fulfilled" ? Number(messages.value) : 0;
+    if (pubResult.status !== "fulfilled" || !pubResult.value) return null;
+    const pub = pubResult.value as {
+      status: number;
+      tier: number;
+      stakedAmount: bigint;
+      subscriberCount: bigint;
+      messageCount: bigint;
+      totalRevenue: bigint;
+      lastActiveTimestamp: bigint;
+    };
 
-    if (infoResult) {
-      return {
-        topic: infoResult[0] || "unknown",
-        description: infoResult[1] || "",
-        pricePerKB: Number(infoResult[2]),
-        frequency: Number(infoResult[3]),
-        active: infoResult[4],
-        pqs: scoreResult,
-        tier: tierResult,
-        subscribers: subsResult,
-        messages: msgsResult,
-      };
-    }
+    // Skip unregistered or banned publishers.
+    if (Number(pub.status) === 0 || Number(pub.status) === 4) return null;
 
-    return null;
+    const schema =
+      schemaResult.status === "fulfilled" && schemaResult.value
+        ? (schemaResult.value as {
+            frequencySeconds: number;
+            topic: string;
+            pricePerKB: bigint;
+            active: boolean;
+          })
+        : null;
+
+    const pqs =
+      pqsResult.status === "fulfilled" && pqsResult.value
+        ? (pqsResult.value as { composite: bigint })
+        : null;
+
+    return {
+      status: Number(pub.status),
+      tier: TIER_NAMES[Number(pub.tier)] ?? "New",
+      topic: schema ? decodeTopic(schema.topic) : "data-feed",
+      pricePerKB: schema ? Number(schema.pricePerKB) : 0,
+      frequencySeconds: schema ? Number(schema.frequencySeconds) : 0,
+      active: schema ? schema.active : false,
+      pqs: pqs ? Number(pqs.composite) : 0,
+      subscribers: Number(pub.subscriberCount),
+      messages: Number(pub.messageCount),
+    };
   } catch {
     return null;
   }
@@ -152,22 +180,19 @@ async function getOnChainPublisherData(publisher: `0x${string}`): Promise<{
 export async function getFeeds(
   attestationCounts: Map<string, { positive: number; negative: number }>
 ): Promise<DiscoveryResponse> {
-  // Try indexer first for publisher list
   const indexerData = await fetchFromIndexer("/publishers");
 
   let feeds: Feed[] = [];
   let totalMessages = 0;
 
   if (indexerData && Array.isArray(indexerData)) {
-    // Build feeds from indexer data, enrich with on-chain
+    // Indexer-driven: fast path, enriched with fresh on-chain reads.
     const feedPromises = indexerData.map(async (pub: any) => {
       const address = pub.address || pub.publisher;
       const onChain = await getOnChainPublisherData(address as `0x${string}`);
+      if (!onChain) return null;
 
-      const topic = onChain?.topic || pub.topic || "unknown";
-      const msgCount = onChain?.messages || pub.messageCount || pub.messages || 0;
-      totalMessages += msgCount;
-
+      totalMessages += onChain.messages;
       const att = attestationCounts.get(address.toLowerCase()) || {
         positive: 0,
         negative: 0,
@@ -175,35 +200,35 @@ export async function getFeeds(
 
       return {
         publisher: address,
-        topic,
-        description: onChain?.description || pub.description || "",
-        tier: onChain?.tier || pub.tier || "New",
-        pqs: onChain?.pqs ?? pub.pqs ?? 10000,
-        pricePerKB: onChain?.pricePerKB ?? pub.pricePerKB ?? 1000,
-        frequency: onChain?.frequency ?? pub.frequency ?? 3600,
-        subscribers: onChain?.subscribers ?? pub.subscribers ?? 0,
-        messages: msgCount,
+        topic: onChain.topic,
+        tier: onChain.tier,
+        pqs: onChain.pqs,
+        pricePerKB: onChain.pricePerKB,
+        frequencySeconds: onChain.frequencySeconds,
+        subscribers: onChain.subscribers,
+        messages: onChain.messages,
         attestations: {
           positive: att.positive,
           negative: att.negative,
           total: att.positive + att.negative,
         },
         endpoints: {
-          x402: `${config.x402Gateway}/feeds/${topic}`,
+          x402: `${config.x402Gateway}/feeds/${onChain.topic}`,
           mcp: "byte_subscribe",
           onchain: contracts.DataStream,
         },
       } satisfies Feed;
     });
 
-    feeds = await Promise.all(feedPromises);
+    const settled = await Promise.all(feedPromises);
+    feeds = settled.filter((f) => f !== null) as Feed[];
   } else {
-    // Fallback: try on-chain publisher enumeration
+    // Fallback path: enumerate publishers directly from the registry.
     try {
       const count = await client.readContract({
         address: contracts.DataRegistry,
         abi: DataRegistryABI,
-        functionName: "getPublisherCount",
+        functionName: "getPublisherListLength",
       });
 
       const pubCount = Number(count);
@@ -212,47 +237,44 @@ export async function getFeeds(
           const address = await client.readContract({
             address: contracts.DataRegistry,
             abi: DataRegistryABI,
-            functionName: "getPublisherByIndex",
+            functionName: "publisherList",
             args: [BigInt(i)],
           });
 
-          const onChain = await getOnChainPublisherData(
-            address as `0x${string}`
-          );
-          if (onChain && onChain.active) {
-            totalMessages += onChain.messages;
-            const att = attestationCounts.get(
-              (address as string).toLowerCase()
-            ) || { positive: 0, negative: 0 };
+          const onChain = await getOnChainPublisherData(address as `0x${string}`);
+          if (!onChain) continue;
 
-            feeds.push({
-              publisher: address as string,
-              topic: onChain.topic,
-              description: onChain.description,
-              tier: onChain.tier,
-              pqs: onChain.pqs,
-              pricePerKB: onChain.pricePerKB,
-              frequency: onChain.frequency,
-              subscribers: onChain.subscribers,
-              messages: onChain.messages,
-              attestations: {
-                positive: att.positive,
-                negative: att.negative,
-                total: att.positive + att.negative,
-              },
-              endpoints: {
-                x402: `${config.x402Gateway}/feeds/${onChain.topic}`,
-                mcp: "byte_subscribe",
-                onchain: contracts.DataStream,
-              },
-            });
-          }
+          totalMessages += onChain.messages;
+          const att = attestationCounts.get(
+            (address as string).toLowerCase()
+          ) || { positive: 0, negative: 0 };
+
+          feeds.push({
+            publisher: address as string,
+            topic: onChain.topic,
+            tier: onChain.tier,
+            pqs: onChain.pqs,
+            pricePerKB: onChain.pricePerKB,
+            frequencySeconds: onChain.frequencySeconds,
+            subscribers: onChain.subscribers,
+            messages: onChain.messages,
+            attestations: {
+              positive: att.positive,
+              negative: att.negative,
+              total: att.positive + att.negative,
+            },
+            endpoints: {
+              x402: `${config.x402Gateway}/feeds/${onChain.topic}`,
+              mcp: "byte_subscribe",
+              onchain: contracts.DataStream,
+            },
+          });
         } catch {
-          // Skip invalid publisher index
+          // Skip individual publisher read failures and continue.
         }
       }
     } catch {
-      // No on-chain data available
+      // No on-chain data available — return empty feed list.
     }
   }
 

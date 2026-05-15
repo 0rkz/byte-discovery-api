@@ -5,8 +5,14 @@ dotenv.config();
 export const config = {
   port: parseInt(process.env.PORT || "3500", 10),
   rpcUrl: process.env.RPC_URL || "https://sepolia-rollup.arbitrum.io/rpc",
-  indexerUrl: process.env.INDEXER_URL || "http://localhost:8080",
+
+  // Public-facing URLs surfaced in /.well-known/byte-protocol.json + /discover.
+  // Override via env in production deploys; default to localhost for local dev.
+  publicBaseUrl: process.env.PUBLIC_BASE_URL || "https://api.payperbyte.io",
+  indexerUrl: process.env.INDEXER_URL || "https://feeds.payperbyte.io",
+  marketplaceUrl: process.env.MARKETPLACE_URL || "https://www.payperbyte.io",
   x402Gateway: process.env.X402_GATEWAY || "http://localhost:3402",
+
   chainId: 421614,
   chain: "arbitrum-sepolia",
 } as const;
@@ -18,71 +24,116 @@ export const contracts = {
   SchemaRegistry: "0x2e490F33180F3d387d46c213ADf776135c052acf" as const,
   PQSVerifier: "0x67F97fc5E45889d3BFf7dcBA114Ca210f1896b0d" as const,
   Faucet: "0x19d25F286b8Dca21886bCBe9c21334C6F0C532FB" as const,
+  PPBToken: "0x37a86eD3ee87109ff8cF96B3fe45c70a2ebB69f3" as const,
+  AgentAttestation: "0xA20ad0c5b5e37954030C290a887020ACebaAA49C" as const,
 } as const;
 
-/** Minimal ABI for reading publisher quality scores from PQSVerifier. */
+/** PQSVerifier — getVerifiedPQS returns the on-chain median composite. */
 export const PQSVerifierABI = [
   {
-    inputs: [{ name: "publisher", type: "address" }],
-    name: "getPublisherScore",
-    outputs: [{ name: "score", type: "uint256" }],
-    stateMutability: "view",
+    name: "getVerifiedPQS",
     type: "function",
-  },
-  {
-    inputs: [{ name: "publisher", type: "address" }],
-    name: "getPublisherTier",
-    outputs: [{ name: "tier", type: "string" }],
     stateMutability: "view",
-    type: "function",
+    inputs: [{ name: "publisher", type: "address" }],
+    outputs: [
+      {
+        name: "",
+        type: "tuple",
+        components: [
+          { name: "disputeScore", type: "uint256" },
+          { name: "retentionScore", type: "uint256" },
+          { name: "freshnessScore", type: "uint256" },
+          { name: "revenueQuality", type: "uint256" },
+          { name: "composite", type: "uint256" },
+          { name: "timestamp", type: "uint256" },
+        ],
+      },
+    ],
   },
 ] as const;
 
-/** Minimal ABI for reading publisher metadata from DataRegistry. */
+/**
+ * DataRegistry — canonical Publisher tuple field order. Viem decodes by position,
+ * so this MUST match the Solidity struct in DataRegistry.sol exactly.
+ */
 export const DataRegistryABI = [
   {
+    name: "getPublisher",
+    type: "function",
+    stateMutability: "view",
     inputs: [{ name: "publisher", type: "address" }],
-    name: "getPublisherInfo",
     outputs: [
-      { name: "topic", type: "string" },
-      { name: "description", type: "string" },
-      { name: "pricePerKB", type: "uint256" },
-      { name: "frequency", type: "uint256" },
-      { name: "active", type: "bool" },
+      {
+        name: "",
+        type: "tuple",
+        components: [
+          { name: "status", type: "uint8" },
+          { name: "tier", type: "uint8" },
+          { name: "stakedAmount", type: "uint256" },
+          { name: "sandboxStartTime", type: "uint256" },
+          { name: "registeredAt", type: "uint256" },
+          { name: "subscriberCount", type: "uint256" },
+          { name: "messageCount", type: "uint256" },
+          { name: "totalRevenue", type: "uint256" },
+          { name: "lastActiveTimestamp", type: "uint256" },
+          { name: "publicKey", type: "bytes32" },
+          { name: "slashCount", type: "uint256" },
+        ],
+      },
     ],
-    stateMutability: "view",
-    type: "function",
   },
   {
+    name: "getPublisherListLength",
+    type: "function",
+    stateMutability: "view",
     inputs: [],
-    name: "getPublisherCount",
     outputs: [{ name: "", type: "uint256" }],
-    stateMutability: "view",
-    type: "function",
   },
   {
-    inputs: [{ name: "index", type: "uint256" }],
-    name: "getPublisherByIndex",
-    outputs: [{ name: "", type: "address" }],
-    stateMutability: "view",
+    name: "publisherList",
     type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "", type: "uint256" }],
+    outputs: [{ name: "", type: "address" }],
   },
 ] as const;
 
-/** Minimal ABI for reading subscriber/message counts from DataStream. */
-export const DataStreamABI = [
+/** SchemaRegistry — Schema tuple. First three fields are uint32 (NOT uint256). */
+export const SchemaRegistryABI = [
   {
-    inputs: [{ name: "publisher", type: "address" }],
-    name: "getSubscriberCount",
-    outputs: [{ name: "", type: "uint256" }],
-    stateMutability: "view",
+    name: "getSchema",
     type: "function",
-  },
-  {
-    inputs: [{ name: "publisher", type: "address" }],
-    name: "getMessageCount",
-    outputs: [{ name: "", type: "uint256" }],
     stateMutability: "view",
-    type: "function",
+    inputs: [{ name: "publisher", type: "address" }],
+    outputs: [
+      {
+        name: "",
+        type: "tuple",
+        components: [
+          { name: "expectedSize", type: "uint32" },
+          { name: "maxSize", type: "uint32" },
+          { name: "frequencySeconds", type: "uint32" },
+          { name: "pubClass", type: "uint8" },
+          { name: "verType", type: "uint8" },
+          { name: "methodologyHash", type: "bytes32" },
+          { name: "topic", type: "bytes32" },
+          { name: "pricePerKB", type: "uint256" },
+          { name: "active", type: "bool" },
+          { name: "registeredAt", type: "uint256" },
+        ],
+      },
+    ],
   },
+] as const;
+
+/** Maps the on-chain tier enum (0-4) to display labels. */
+export const TIER_NAMES = ["New", "Established", "Trusted", "Premium", "Elite"] as const;
+
+/** Maps the on-chain status enum to display labels. */
+export const STATUS_NAMES = [
+  "Unregistered",
+  "Sandbox",
+  "Active",
+  "Suspended",
+  "Banned",
 ] as const;
