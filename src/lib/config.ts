@@ -22,7 +22,7 @@ export const contracts = {
   DataRegistry: "0x05D89769A066549115b1B4408bFf899D2737F30b" as const,
   DataStream: "0x7E12bF2B0d43B9Ea0Bc37A06EcAC36b810351F35" as const,
   SchemaRegistry: "0x2e490F33180F3d387d46c213ADf776135c052acf" as const,
-  PQSVerifier: "0x67F97fc5E45889d3BFf7dcBA114Ca210f1896b0d" as const,
+  PQSVerifier: "0xD7c8423296a6E2Dd36466AC0e41884846a27cdE9" as const,
   Faucet: "0x19d25F286b8Dca21886bCBe9c21334C6F0C532FB" as const,
   PPBToken: "0x37a86eD3ee87109ff8cF96B3fe45c70a2ebB69f3" as const,
   AgentAttestation: "0xA20ad0c5b5e37954030C290a887020ACebaAA49C" as const,
