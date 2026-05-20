@@ -35,7 +35,7 @@ export interface Feed {
   messages: number;
   attestations: { positive: number; negative: number; total: number };
   endpoints: {
-    x402: string;
+    x402?: string;
     mcp: string;
     onchain: string;
   };
@@ -88,6 +88,46 @@ async function fetchFromIndexer(path: string): Promise<any> {
   } catch {
     return null;
   }
+}
+
+/**
+ * Fetch the set of topics the x402 gateway actually serves. Used to gate the
+ * `x402` endpoint URL — most on-chain publishers are not fronted by the
+ * gateway, and advertising a gateway URL for them yields a 404 for the agent.
+ * Returns an empty set on any failure (→ x402 omitted, mcp/onchain still given).
+ */
+async function fetchX402Topics(): Promise<Set<string>> {
+  try {
+    const res = await fetch(`${config.x402Gateway}/feeds`);
+    if (!res.ok) return new Set();
+    const data = await res.json();
+    const feeds = Array.isArray(data?.feeds) ? data.feeds : [];
+    return new Set(
+      feeds
+        .map((f: any) => (f.topic ?? f.id ?? "").toString().toLowerCase())
+        .filter(Boolean)
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Build a feed's access endpoints. `mcp` and `onchain` always apply; `x402` is
+ * included only when the gateway serves that topic.
+ */
+function buildEndpoints(
+  topic: string,
+  x402Topics: Set<string>
+): Feed["endpoints"] {
+  const endpoints: Feed["endpoints"] = {
+    mcp: "byte_subscribe",
+    onchain: contracts.DataStream,
+  };
+  if (x402Topics.has(topic.toLowerCase())) {
+    endpoints.x402 = `${config.x402Gateway}/feeds/${topic}`;
+  }
+  return endpoints;
 }
 
 /**
@@ -180,7 +220,10 @@ async function getOnChainPublisherData(publisher: `0x${string}`): Promise<{
 export async function getFeeds(
   attestationCounts: Map<string, { positive: number; negative: number }>
 ): Promise<DiscoveryResponse> {
-  const indexerData = await fetchFromIndexer("/publishers");
+  const [indexerData, x402Topics] = await Promise.all([
+    fetchFromIndexer("/publishers"),
+    fetchX402Topics(),
+  ]);
 
   let feeds: Feed[] = [];
   let totalMessages = 0;
@@ -212,11 +255,7 @@ export async function getFeeds(
           negative: att.negative,
           total: att.positive + att.negative,
         },
-        endpoints: {
-          x402: `${config.x402Gateway}/feeds/${onChain.topic}`,
-          mcp: "byte_subscribe",
-          onchain: contracts.DataStream,
-        },
+        endpoints: buildEndpoints(onChain.topic, x402Topics),
       } satisfies Feed;
     });
 
@@ -263,11 +302,7 @@ export async function getFeeds(
               negative: att.negative,
               total: att.positive + att.negative,
             },
-            endpoints: {
-              x402: `${config.x402Gateway}/feeds/${onChain.topic}`,
-              mcp: "byte_subscribe",
-              onchain: contracts.DataStream,
-            },
+            endpoints: buildEndpoints(onChain.topic, x402Topics),
           });
         } catch {
           // Skip individual publisher read failures and continue.
