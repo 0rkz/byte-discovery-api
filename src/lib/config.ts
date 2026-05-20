@@ -15,12 +15,47 @@ export const config = {
 
   chainId: 421614,
   chain: "arbitrum-sepolia",
+
+  // v0.6 bundled redeploy — deploy block on Arbitrum Sepolia (chain 421614).
+  // Source: byte-protocol-contracts/deployments/arbitrum-sepolia.json "v06".
+  deployBlock: 269821555,
+  protocolVersion: "0.6" as const,
 } as const;
 
-/** Deployed Byte Protocol contract addresses on Arbitrum Sepolia. */
+/**
+ * Deployed Byte Protocol contract addresses on Arbitrum Sepolia.
+ *
+ * Default = v0.6 (bundled redeploy went live 2026-05-20; v0.5 is PAUSED).
+ * SchemaRegistry, PPBToken, PQSVerifier and TestnetFaucet are reused across
+ * v0.5/v0.6 — unchanged. The legacy v0.5 set is preserved in `contracts_v0_5`
+ * for the `/contracts/v0_5` backward-compat route during the cutover window.
+ */
 export const contracts = {
+  DataRegistry: "0x85868CEF6db4531c8c6E378b725BC2813233e014" as const,
+  DataStream: "0x8a20759a89f037B9c2062758f2789A1f858b0b27" as const,
+  ReputationEngine: "0xaF7cd2544B742Ea9Df439f0f5DD43Ab02Cbb9b56" as const,
+  ValidatorRegistry: "0x7b3f9DA761E2D82FF4faaFfd4e36926049035c4A" as const,
+  StreamSubscription: "0x713d1020C28C60A8735a77743138A78B77Dbb9b2" as const,
+  USDC: "0x1c16659aeb3aE28467E90348fAAB8874a0D3A4d3" as const,
+  SchemaRegistry: "0x2e490F33180F3d387d46c213ADf776135c052acf" as const,
+  PQSVerifier: "0xD7c8423296a6E2Dd36466AC0e41884846a27cdE9" as const,
+  Faucet: "0x19d25F286b8Dca21886bCBe9c21334C6F0C532FB" as const,
+  PPBToken: "0x37a86eD3ee87109ff8cF96B3fe45c70a2ebB69f3" as const,
+  AgentAttestation: "0xA20ad0c5b5e37954030C290a887020ACebaAA49C" as const,
+} as const;
+
+/**
+ * Legacy v0.5 contract addresses — PAUSED as of the 2026-05-20 v0.6 redeploy,
+ * but still on-chain and serving reads + subscriber unwind paths during the
+ * cutover window. Surfaced via the `/contracts/v0_5` route for backward compat.
+ */
+export const contracts_v0_5 = {
   DataRegistry: "0x05D89769A066549115b1B4408bFf899D2737F30b" as const,
   DataStream: "0x7E12bF2B0d43B9Ea0Bc37A06EcAC36b810351F35" as const,
+  ReputationEngine: "0xCef13B96028e4AAEa5889cD99b8740A4f48F5EA0" as const,
+  ValidatorRegistry: "0xEd0Ffa5201994cAC3e17566f445C5D0d0103F016" as const,
+  StreamSubscription: "0xcd3521E655ED4070BD95740cf610E955965B575d" as const,
+  USDC: "0x93BfEbF99AF028ee57B138Fd17a26cAe76a01Fd2" as const,
   SchemaRegistry: "0x2e490F33180F3d387d46c213ADf776135c052acf" as const,
   PQSVerifier: "0xD7c8423296a6E2Dd36466AC0e41884846a27cdE9" as const,
   Faucet: "0x19d25F286b8Dca21886bCBe9c21334C6F0C532FB" as const,
