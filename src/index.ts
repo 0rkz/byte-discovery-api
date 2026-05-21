@@ -209,6 +209,47 @@ app.get("/discover/:topic", async (req, res) => {
   }
 });
 
+// Publisher directory — the publisher-centric view of the same data /discover
+// exposes feed-first. Agents that look a publisher up directly land here
+// instead of 404ing.
+app.get("/publishers", async (_req, res) => {
+  try {
+    const counts = getAttestationCounts();
+    const discovery = await getFeeds(counts);
+    res.json({
+      protocol: "byte",
+      count: discovery.feeds.length,
+      publishers: discovery.feeds,
+    });
+  } catch (err) {
+    console.error("Error fetching publishers:", err);
+    res.status(500).json({ error: "Failed to fetch publisher data" });
+  }
+});
+
+// Single publisher by address — feed metadata, on-chain quality, attestations.
+app.get("/publisher/:address", async (req, res) => {
+  try {
+    const { address } = req.params;
+    const counts = getAttestationCounts();
+    const discovery = await getFeeds(counts);
+
+    const publisher = discovery.feeds.find(
+      (f) => f.publisher.toLowerCase() === address.toLowerCase()
+    );
+
+    if (!publisher) {
+      res.status(404).json({ error: `Publisher not found: ${address}` });
+      return;
+    }
+
+    res.json(publisher);
+  } catch (err) {
+    console.error("Error fetching publisher:", err);
+    res.status(500).json({ error: "Failed to fetch publisher data" });
+  }
+});
+
 // Get attestations for a publisher
 app.get("/attestations/:publisher", (req, res) => {
   const { publisher } = req.params;
@@ -371,6 +412,8 @@ app.listen(config.port, () => {
   console.log(`  /discover          — Browse all feeds`);
   console.log(`  /discover/search   — Search feeds`);
   console.log(`  /discover/:topic   — Get feed by topic`);
+  console.log(`  /publishers        — Publisher directory`);
+  console.log(`  /publisher/:addr   — Get publisher by address`);
   console.log(`  /attestations      — Submit/view attestations`);
   console.log(`  /health            — Health check`);
   console.log(`  /.well-known/byte-protocol.json — Agent discovery file`);
