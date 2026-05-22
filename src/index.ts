@@ -1,8 +1,8 @@
 /**
- * Byte Discovery API
+ * BYTE Library Discovery API
  *
- * Machine-readable REST endpoint for AI agents to discover Byte Protocol
- * data feeds, query publisher metadata, and submit quality attestations.
+ * Machine-readable REST endpoint for AI agents to discover BYTE Library
+ * data feeds and query publisher metadata.
  *
  * @see /.well-known/byte-protocol.json for the standard discovery file.
  */
@@ -13,11 +13,6 @@ import fs from "fs";
 import path from "path";
 import { config, contracts } from "./lib/config";
 import { getFeeds } from "./lib/feeds";
-import {
-  getAttestationsForPublisher,
-  getAttestationCounts,
-  submitAttestation,
-} from "./lib/attestations";
 
 // Payload archive served by feed bots' broadcast_helper.py. Key is the
 // SHA-256 hash committed on-chain → files named {hash}.json (no 0x prefix).
@@ -42,54 +37,45 @@ app.get("/health", (_req, res) => {
 app.get("/.well-known/byte-protocol.json", (_req, res) => {
   res.json({
     protocol: "byte",
-    name: "Pay-Per-Byte Protocol",
+    name: "BYTE Library",
     version: "1.0.0",
-    tagline: "The open market for machine intelligence",
+    tagline:
+      "Per-byte data for AI agents — pay in USDC, no token, no API keys",
     chain: {
       name: "Arbitrum Sepolia",
       chainId: config.chainId,
       type: "testnet",
     },
 
-    value: {
-      for_subscribers:
-        "Per-byte pricing. No API keys. No contracts. No humans in the loop. Quality scored on-chain.",
-      for_publishers:
-        "Stake reputation. Earn 35-70% of subscriber fees. PQS score compounds over time.",
-      quality_guarantee:
-        "PQS reputation scoring + agent attestations + dispute resolution + progressive slashing",
-    },
-
-    trust: {
-      contracts: 17,
-      tests: 516,
-      security_audits: ["Slither (clean)", "Mythril (clean)"],
-      admin_expiry:
-        "Month 13 — enforced by smart contract, not a promise",
-      governance:
-        "Quadratic voting: sqrt(PPB) × (stakingDays / 365)",
-      slashing_schedule: {
-        first_offense: "5% stake",
-        second_offense: "10% stake",
-        third_offense: "25% stake + suspension",
-        fabrication: "25% immediate",
-        fourth_offense: "100% + permanent ban",
-      },
+    model: {
+      summary:
+        "BYTE Library is a first-party catalog of data feeds and oracles " +
+        "for AI agents. Agents pay per byte in USDC; every broadcast " +
+        "commits a content hash on-chain so the data can be verified.",
+      for_agents:
+        "Discover a feed, pay per byte in USDC, receive verifiable data. " +
+        "No accounts, no API keys, no subscriptions, no humans in the loop.",
+      trust:
+        "Verifiability-first — each broadcast's content hash is committed " +
+        "on-chain, so any agent can check the data it paid for against it.",
     },
 
     economics: {
-      settlement: "USDC (per-byte, atomic)",
-      governance_token: "PPB",
-      publisher_take:
-        "35% (New) → 42% (Established) → 50% (Trusted) → 60% (Premium) → 70% (Elite)",
-      fee_split: {
-        publisher: "35-70%",
-        validator: "10%",
-        dividend_pool: "5%",
-        burn_pool: "5%",
-        dev_fund: "remainder",
-      },
-      minimum_fee: "$0.001 USDC per message",
+      settlement: "USDC — per-byte, atomic, on-chain",
+      pricing: "Per kilobyte, set per feed (catalog default $0.003/KB)",
+      token: "None — BYTE Library has no token",
+      commitment: "No API keys, no subscription, no minimum commitment",
+    },
+
+    catalog: {
+      sections: [
+        "Security & trust",
+        "Markets",
+        "Earth & space",
+        "Developer",
+        "Knowledge",
+      ],
+      browse: `${config.publicBaseUrl}/discover`,
     },
 
     access: {
@@ -98,33 +84,21 @@ app.get("/.well-known/byte-protocol.json", (_req, res) => {
       mcp_server: "npx byte-mcp-server",
       indexer_api: config.indexerUrl,
       marketplace: config.marketplaceUrl,
-      github: {
-        sdk: "https://github.com/0rkz/ppb-sdk",
-        mcp: "https://github.com/0rkz/byte-mcp-server",
-        x402: "https://github.com/0rkz/byte-x402-gateway",
-        discovery: "https://github.com/0rkz/byte-discovery-api",
-        cli: "https://github.com/0rkz/ppb-cli",
-      },
-      community: "https://discord.gg/QtJYR2XZ",
     },
 
     contracts: {
       DataRegistry: contracts.DataRegistry,
       DataStream: contracts.DataStream,
       SchemaRegistry: contracts.SchemaRegistry,
-      PPBToken: contracts.PPBToken,
-      TestnetFaucet: contracts.Faucet,
-      PQSVerifier: contracts.PQSVerifier,
-      AgentAttestation: contracts.AgentAttestation,
+      USDC: contracts.USDC,
     },
 
     quick_start: {
-      step_1: "GET /discover to browse available feeds",
-      step_2: "Check PQS scores and attestations for quality",
-      step_3: "Subscribe via MCP tool or x402 gateway",
-      step_4: "Receive data. Rate quality via attestation.",
-      step_5:
-        "Better-rated publishers earn more subscribers. The best data wins.",
+      step_1: "GET /discover to browse the feed catalog",
+      step_2: "Pick a feed; read its price-per-KB and schema",
+      step_3:
+        "Subscribe and pay per byte in USDC via the MCP tool or x402 gateway",
+      step_4: "Receive data with an on-chain content hash you can verify",
     },
   });
 });
@@ -132,8 +106,7 @@ app.get("/.well-known/byte-protocol.json", (_req, res) => {
 // Main discovery endpoint
 app.get("/discover", async (_req, res) => {
   try {
-    const counts = getAttestationCounts();
-    const discovery = await getFeeds(counts);
+    const discovery = await getFeeds();
     res.json(discovery);
   } catch (err) {
     console.error("Error fetching feeds:", err);
@@ -145,12 +118,9 @@ app.get("/discover", async (_req, res) => {
 app.get("/discover/search", async (req, res) => {
   try {
     const q = (req.query.q as string || "").toLowerCase();
-    const minPQS = parseInt(req.query.minPQS as string) || 0;
     const minMessages = parseInt(req.query.minMessages as string) || 0;
-    const tier = (req.query.tier as string || "").toLowerCase();
 
-    const counts = getAttestationCounts();
-    const discovery = await getFeeds(counts);
+    const discovery = await getFeeds();
 
     let filtered = discovery.feeds;
 
@@ -162,21 +132,13 @@ app.get("/discover/search", async (req, res) => {
       );
     }
 
-    if (minPQS > 0) {
-      filtered = filtered.filter((f) => f.pqs >= minPQS);
-    }
-
     if (minMessages > 0) {
       filtered = filtered.filter((f) => f.messages >= minMessages);
     }
 
-    if (tier) {
-      filtered = filtered.filter((f) => f.tier.toLowerCase() === tier);
-    }
-
     res.json({
       protocol: "byte",
-      query: { q, minPQS, minMessages, tier: tier || undefined },
+      query: { q, minMessages },
       results: filtered.length,
       feeds: filtered,
     });
@@ -190,8 +152,7 @@ app.get("/discover/search", async (req, res) => {
 app.get("/discover/:topic", async (req, res) => {
   try {
     const { topic } = req.params;
-    const counts = getAttestationCounts();
-    const discovery = await getFeeds(counts);
+    const discovery = await getFeeds();
 
     const feed = discovery.feeds.find(
       (f) => f.topic.toLowerCase() === topic.toLowerCase()
@@ -214,8 +175,7 @@ app.get("/discover/:topic", async (req, res) => {
 // instead of 404ing.
 app.get("/publishers", async (_req, res) => {
   try {
-    const counts = getAttestationCounts();
-    const discovery = await getFeeds(counts);
+    const discovery = await getFeeds();
     res.json({
       protocol: "byte",
       count: discovery.feeds.length,
@@ -227,12 +187,11 @@ app.get("/publishers", async (_req, res) => {
   }
 });
 
-// Single publisher by address — feed metadata, on-chain quality, attestations.
+// Single publisher by address — feed metadata and on-chain stats.
 app.get("/publisher/:address", async (req, res) => {
   try {
     const { address } = req.params;
-    const counts = getAttestationCounts();
-    const discovery = await getFeeds(counts);
+    const discovery = await getFeeds();
 
     const publisher = discovery.feeds.find(
       (f) => f.publisher.toLowerCase() === address.toLowerCase()
@@ -247,47 +206,6 @@ app.get("/publisher/:address", async (req, res) => {
   } catch (err) {
     console.error("Error fetching publisher:", err);
     res.status(500).json({ error: "Failed to fetch publisher data" });
-  }
-});
-
-// Get attestations for a publisher
-app.get("/attestations/:publisher", (req, res) => {
-  const { publisher } = req.params;
-  const attestations = getAttestationsForPublisher(publisher);
-
-  const positive = attestations.filter((a) => a.score >= 7000).length;
-  const negative = attestations.length - positive;
-
-  res.json({
-    publisher,
-    total: attestations.length,
-    positive,
-    negative,
-    average_score:
-      attestations.length > 0
-        ? Math.round(
-            attestations.reduce((sum, a) => sum + a.score, 0) /
-              attestations.length
-          )
-        : null,
-    attestations,
-  });
-});
-
-// Submit attestation
-app.post("/attestations", async (req, res) => {
-  try {
-    const result = await submitAttestation(req.body);
-
-    if (!result.success) {
-      res.status(400).json({ error: result.error });
-      return;
-    }
-
-    res.status(201).json({ success: true, message: "Attestation recorded" });
-  } catch (err) {
-    console.error("Error submitting attestation:", err);
-    res.status(500).json({ error: "Failed to process attestation" });
   }
 });
 
@@ -414,7 +332,6 @@ app.listen(config.port, () => {
   console.log(`  /discover/:topic   — Get feed by topic`);
   console.log(`  /publishers        — Publisher directory`);
   console.log(`  /publisher/:addr   — Get publisher by address`);
-  console.log(`  /attestations      — Submit/view attestations`);
   console.log(`  /health            — Health check`);
   console.log(`  /.well-known/byte-protocol.json — Agent discovery file`);
 });

@@ -1,9 +1,9 @@
 /**
  * Feed discovery module.
  *
- * Enumerates data feed publishers from the Byte Protocol indexer (preferred)
+ * Enumerates data feed publishers from the BYTE Library indexer (preferred)
  * or falls back to on-chain enumeration via DataRegistry. Each feed is
- * enriched with PQS scores, schema metadata, and attestation summaries.
+ * enriched with schema metadata and access endpoints.
  */
 
 import { createPublicClient, http } from "viem";
@@ -11,10 +11,8 @@ import { arbitrumSepolia } from "viem/chains";
 import {
   config,
   contracts,
-  PQSVerifierABI,
   DataRegistryABI,
   SchemaRegistryABI,
-  TIER_NAMES,
 } from "./config.js";
 
 /** Viem public client for Arbitrum Sepolia on-chain reads. */
@@ -23,17 +21,14 @@ const client = createPublicClient({
   transport: http(config.rpcUrl),
 });
 
-/** A single data feed with publisher metadata, quality scores, and access endpoints. */
+/** A single data feed with publisher metadata and access endpoints. */
 export interface Feed {
   publisher: string;
   topic: string;
-  tier: string;
-  pqs: number; // composite, 0-10000 BPS
   pricePerKB: number; // µUSDC (6 decimals)
   frequencySeconds: number;
   subscribers: number;
   messages: number;
-  attestations: { positive: number; negative: number; total: number };
   endpoints: {
     x402?: string;
     mcp: string;
@@ -54,7 +49,6 @@ export interface DiscoveryResponse {
     x402_gateway: string;
     mcp_server: string;
     indexer_api: string;
-    faucet: string;
   };
 }
 
@@ -79,7 +73,7 @@ function decodeTopic(hex: string): string {
   return str;
 }
 
-/** Fetch JSON from the Byte indexer, returning null on any failure. */
+/** Fetch JSON from the BYTE Library indexer, returning null on any failure. */
 async function fetchFromIndexer(path: string): Promise<any> {
   try {
     const res = await fetch(`${config.indexerUrl}${path}`);
@@ -131,23 +125,21 @@ function buildEndpoints(
 }
 
 /**
- * Read a publisher's full state by joining DataRegistry, SchemaRegistry, and
- * PQSVerifier in parallel. Returns null if the publisher's core record can't
- * be read; individual missing pieces (schema, PQS) get safe defaults.
+ * Read a publisher's state by joining DataRegistry and SchemaRegistry in
+ * parallel. Returns null if the publisher's core record can't be read;
+ * a missing schema gets safe defaults.
  */
 async function getOnChainPublisherData(publisher: `0x${string}`): Promise<{
   status: number;
-  tier: string;
   topic: string;
   pricePerKB: number;
   frequencySeconds: number;
   active: boolean;
-  pqs: number;
   subscribers: number;
   messages: number;
 } | null> {
   try {
-    const [pubResult, schemaResult, pqsResult] = await Promise.allSettled([
+    const [pubResult, schemaResult] = await Promise.allSettled([
       client.readContract({
         address: contracts.DataRegistry,
         abi: DataRegistryABI,
@@ -160,23 +152,13 @@ async function getOnChainPublisherData(publisher: `0x${string}`): Promise<{
         functionName: "getSchema",
         args: [publisher],
       }),
-      client.readContract({
-        address: contracts.PQSVerifier,
-        abi: PQSVerifierABI,
-        functionName: "getVerifiedPQS",
-        args: [publisher],
-      }),
     ]);
 
     if (pubResult.status !== "fulfilled" || !pubResult.value) return null;
     const pub = pubResult.value as {
       status: number;
-      tier: number;
-      stakedAmount: bigint;
       subscriberCount: bigint;
       messageCount: bigint;
-      totalRevenue: bigint;
-      lastActiveTimestamp: bigint;
     };
 
     // Skip unregistered or banned publishers.
@@ -192,19 +174,12 @@ async function getOnChainPublisherData(publisher: `0x${string}`): Promise<{
           })
         : null;
 
-    const pqs =
-      pqsResult.status === "fulfilled" && pqsResult.value
-        ? (pqsResult.value as { composite: bigint })
-        : null;
-
     return {
       status: Number(pub.status),
-      tier: TIER_NAMES[Number(pub.tier)] ?? "New",
       topic: schema ? decodeTopic(schema.topic) : "data-feed",
       pricePerKB: schema ? Number(schema.pricePerKB) : 0,
       frequencySeconds: schema ? Number(schema.frequencySeconds) : 0,
       active: schema ? schema.active : false,
-      pqs: pqs ? Number(pqs.composite) : 0,
       subscribers: Number(pub.subscriberCount),
       messages: Number(pub.messageCount),
     };
@@ -214,12 +189,10 @@ async function getOnChainPublisherData(publisher: `0x${string}`): Promise<{
 }
 
 /**
- * Build the full discovery response: enumerate publishers, enrich with
- * on-chain data, and merge attestation counts.
+ * Build the full discovery response: enumerate publishers and enrich each
+ * with on-chain data.
  */
-export async function getFeeds(
-  attestationCounts: Map<string, { positive: number; negative: number }>
-): Promise<DiscoveryResponse> {
+export async function getFeeds(): Promise<DiscoveryResponse> {
   const [indexerData, x402Topics] = await Promise.all([
     fetchFromIndexer("/publishers"),
     fetchX402Topics(),
@@ -236,25 +209,14 @@ export async function getFeeds(
       if (!onChain) return null;
 
       totalMessages += onChain.messages;
-      const att = attestationCounts.get(address.toLowerCase()) || {
-        positive: 0,
-        negative: 0,
-      };
 
       return {
         publisher: address,
         topic: onChain.topic,
-        tier: onChain.tier,
-        pqs: onChain.pqs,
         pricePerKB: onChain.pricePerKB,
         frequencySeconds: onChain.frequencySeconds,
         subscribers: onChain.subscribers,
         messages: onChain.messages,
-        attestations: {
-          positive: att.positive,
-          negative: att.negative,
-          total: att.positive + att.negative,
-        },
         endpoints: buildEndpoints(onChain.topic, x402Topics),
       } satisfies Feed;
     });
@@ -284,24 +246,14 @@ export async function getFeeds(
           if (!onChain) continue;
 
           totalMessages += onChain.messages;
-          const att = attestationCounts.get(
-            (address as string).toLowerCase()
-          ) || { positive: 0, negative: 0 };
 
           feeds.push({
             publisher: address as string,
             topic: onChain.topic,
-            tier: onChain.tier,
-            pqs: onChain.pqs,
             pricePerKB: onChain.pricePerKB,
             frequencySeconds: onChain.frequencySeconds,
             subscribers: onChain.subscribers,
             messages: onChain.messages,
-            attestations: {
-              positive: att.positive,
-              negative: att.negative,
-              total: att.positive + att.negative,
-            },
             endpoints: buildEndpoints(onChain.topic, x402Topics),
           });
         } catch {
@@ -325,7 +277,6 @@ export async function getFeeds(
       x402_gateway: config.x402Gateway,
       mcp_server: "npx byte-mcp-server",
       indexer_api: config.indexerUrl,
-      faucet: contracts.Faucet,
     },
   };
 }
