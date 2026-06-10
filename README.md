@@ -1,8 +1,8 @@
 # Byte Discovery API
 
-Machine-readable discovery endpoint for AI agents to find, evaluate, and subscribe to Byte Protocol data feeds.
+Machine-readable discovery endpoint for AI agents to find, evaluate, and subscribe to verified Byte Protocol data feeds.
 
-Agents hit `/.well-known/byte-protocol.json` to bootstrap -- it returns every contract address, endpoint URL, and capability they need. From there, `/discover` lists all active feeds with quality scores, pricing, and attestation summaries.
+Agents hit `/.well-known/byte-protocol.json` to bootstrap -- it returns every contract address, endpoint URL, and capability they need. From there, `/discover` lists all active feeds with quality scores, pricing, and provenance/attestation summaries.
 
 ## The `.well-known/byte-protocol.json` Standard
 
@@ -13,14 +13,13 @@ Byte Protocol publishers and discovery nodes serve a static JSON file at the wel
   "protocol": "byte",
   "version": "1.0",
   "name": "Byte Protocol Discovery",
-  "description": "Decentralized machine-to-machine data marketplace. Query /discover for available feeds.",
+  "description": "The verified, provenance-first data layer for AI agents. Query /discover for available feeds.",
   "chain": "arbitrum-sepolia",
   "chainId": 421614,
   "contracts": {
     "DataRegistry": "0x05D8...",
     "DataStream": "0x7E12...",
-    "SchemaRegistry": "0x2e49...",
-    "PQSVerifier": "0x67F9..."
+    "SchemaRegistry": "0x2e49..."
   },
   "endpoints": {
     "discover": "/discover",
@@ -253,10 +252,9 @@ The Discovery API aggregates data from two sources:
 2. **On-chain fallback** -- if the indexer is unavailable, enumerates publishers directly from the `DataRegistry` contract on Arbitrum Sepolia.
 
 Each publisher is enriched with:
-- **PQS (Publisher Quality Score)** from the `PQSVerifier` contract (0-10000 scale)
-- **Tier classification** (`Gold`, `Silver`, `Bronze`, `New`) from `PQSVerifier`
+- **Quality score** (0-10000 scale) and **tier classification** (`Gold`, `Silver`, `Bronze`, `New`) derived from feed quality metrics and agent attestations. Note: an on-chain `PQSVerifier` contract is not part of the current 3-contract BYTE Library deploy; scoring is computed from attestation and feed data, not read from a deployed PQS contract.
 - **Subscriber and message counts** from the `DataStream` contract
-- **Attestation summaries** from locally stored agent attestations
+- **Provenance and attestation summaries** from agent-signed attestations stored alongside the discovery index
 
 ## License
 

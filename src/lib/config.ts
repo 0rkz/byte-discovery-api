@@ -33,7 +33,12 @@ export const config = {
  */
 export const contracts = {
   DataRegistry: "0x086990937Cf931e36E01487CD63407f281f1Fc6A" as const,
-  DataStream: "0x4b24006bc32A08176D5e2E779f8328Ce4384c053" as const,
+  // BYTE Library r2 redeploy: bump to the new DataStreamLib address at
+  // cut-over (task #7 Phase 6). discovery-api doesn't decode events from
+  // this contract — the pin is metadata served via the discovery surface —
+  // but the value must be current so consumers reading the published
+  // address point at the live contract.
+  DataStream: "0x44729bB148F46d8Db509E47b0453edc271e06e95" as const,
   SchemaRegistry: "0x4102BA342A3e9f495bD553D99D1590470C32EE88" as const,
   USDC: "0x1c16659aeb3aE28467E90348fAAB8874a0D3A4d3" as const,
 } as const;

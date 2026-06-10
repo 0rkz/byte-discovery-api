@@ -1,7 +1,7 @@
 {
   "name": "byte-discovery-api",
   "version": "1.0.0",
-  "description": "Agent Discovery API for Byte Protocol — machine-readable REST endpoint for AI agent feed discovery",
+  "description": "Agent Discovery API for BYTE — machine-readable REST endpoint for AI agents to discover the verified, provenance-first data layer of feeds",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",

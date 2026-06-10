@@ -11,6 +11,7 @@ import express from "express";
 import cors from "cors";
 import fs from "fs";
 import path from "path";
+import { keccak256, toBytes } from "viem";
 import { config, contracts } from "./lib/config";
 import { getFeeds } from "./lib/feeds";
 
@@ -211,6 +212,13 @@ app.get("/publisher/:address", async (req, res) => {
 
 // Payload archive — look up a broadcast's full JSON by its on-chain hash.
 // Mercat links here from publisher cards to render "latest published" payloads.
+//
+// r2 defense-in-depth: when served, re-derive keccak256 over the canonical
+// payload bytes and log a warning on mismatch. Bytes are still served (a
+// false-positive caused by a canonicalization quirk would otherwise break
+// production); the warning surfaces archive-corruption signal without
+// breaking consumers. The subscriber-side SDK verifyPayload is the
+// authoritative check.
 app.get("/payload/:hash", (req, res) => {
   const raw = (req.params.hash || "").toLowerCase();
   const hash = raw.startsWith("0x") ? raw.slice(2) : raw;
@@ -224,6 +232,18 @@ app.get("/payload/:hash", (req, res) => {
   const filePath = path.join(PAYLOAD_ARCHIVE_DIR, `${hash}.json`);
   try {
     const body = fs.readFileSync(filePath, "utf8");
+    try {
+      const envelope = JSON.parse(body);
+      const canonical = JSON.stringify(envelope.payload);
+      const derived = keccak256(toBytes(canonical)).slice(2).toLowerCase();
+      if (derived !== hash) {
+        console.warn(
+          `[archive] hash drift for ${hash}: derived=${derived} (may be canonicalization, not corruption)`,
+        );
+      }
+    } catch {
+      // Verification is best-effort observability; never break the read path.
+    }
     res.setHeader("Content-Type", "application/json");
     res.send(body);
   } catch (err: any) {
