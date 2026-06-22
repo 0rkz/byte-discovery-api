@@ -189,6 +189,25 @@ async function getOnChainPublisherData(publisher: `0x${string}`): Promise<{
 }
 
 /**
+ * Topics whose on-chain publishers are still registered but whose feeds have
+ * been DELISTED from the product (retired or superseded). getFeeds enumerates
+ * on-chain publishers, so without this filter the discovery API advertises dead
+ * feeds and points agents at endpoints the product no longer serves. Keep in
+ * sync with the gateway's delistings (x402-gateway feedRegistry).
+ */
+const DELISTED_TOPICS = new Set([
+  "crypto-top100", // delisted 2026-06-12 (commodity; CoinGecko no-resale)
+  "btc-metrics", // legacy, retired
+  "token-safety", // delisted 2026-06-12 (provider licensing pending)
+  "fact-oracle", // retired
+  "merchant-trust", // superseded by address-reputation
+  "pkg-facts", // superseded by pkg-verdict
+  "cve-facts", // superseded by threat-intel
+  "wiki-facts", // retired
+  "bridge-flow", // retired
+]);
+
+/**
  * Build the full discovery response: enumerate publishers and enrich each
  * with on-chain data.
  */
@@ -264,6 +283,12 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
       // No on-chain data available — return empty feed list.
     }
   }
+
+  // Drop delisted feeds whose on-chain publishers are still registered, so the
+  // catalog reflects the LIVE product (not retired/superseded feeds). Recompute
+  // the message total over the surviving feeds.
+  feeds = feeds.filter((f) => !DELISTED_TOPICS.has((f.topic || "").toLowerCase()));
+  totalMessages = feeds.reduce((sum, f) => sum + f.messages, 0);
 
   return {
     protocol: "byte",
