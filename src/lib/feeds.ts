@@ -29,6 +29,11 @@ export interface Feed {
   frequencySeconds: number;
   subscribers: number;
   messages: number;
+  /** Data provenance as advertised by the gateway (e.g. "first-party"). */
+  provenance: string;
+  /** On-chain DataRegistry publisher address, or null for gateway-only
+   *  first-party oracles (which have no on-chain publisher — never faked). */
+  onchain: string | null;
   endpoints: {
     x402?: string;
     mcp: string;
@@ -84,25 +89,42 @@ async function fetchFromIndexer(path: string): Promise<any> {
   }
 }
 
+/** A feed as advertised by the x402 gateway's `/feeds` catalog. */
+interface GatewayFeed {
+  topic: string; // lowercased slug (gateway `id`/`topic`)
+  pricePerKB: number; // µUSDC (gateway `priceAtomic`)
+  provenance: string; // gateway-advertised data provenance
+}
+
 /**
- * Fetch the set of topics the x402 gateway actually serves. Used to gate the
- * `x402` endpoint URL — most on-chain publishers are not fronted by the
- * gateway, and advertising a gateway URL for them yields a 404 for the agent.
- * Returns an empty set on any failure (→ x402 omitted, mcp/onchain still given).
+ * Fetch the full feed catalog the x402 gateway serves. Used for TWO things:
+ *  1. gating the `x402` endpoint URL — most on-chain publishers are not fronted
+ *     by the gateway, and advertising a gateway URL for them 404s for the agent;
+ *  2. surfacing gateway-only first-party oracles (address-reputation, pkg-verdict,
+ *     sanctions-screen, reasoning-verdict, liquidation-stream, positioning-snapshot)
+ *     that have NO on-chain DataRegistry publisher, so the indexer/chain
+ *     enumeration never sees them.
+ * Returns [] on any failure (→ no x402 decoration, no gateway merge; graceful).
  */
-async function fetchX402Topics(): Promise<Set<string>> {
+async function fetchX402Feeds(): Promise<GatewayFeed[]> {
   try {
     const res = await fetch(`${config.x402Gateway}/feeds`);
-    if (!res.ok) return new Set();
+    if (!res.ok) return [];
     const data = await res.json();
     const feeds = Array.isArray(data?.feeds) ? data.feeds : [];
-    return new Set(
-      feeds
-        .map((f: any) => (f.topic ?? f.id ?? "").toString().toLowerCase())
-        .filter(Boolean)
-    );
+    return feeds
+      .map((f: any): GatewayFeed | null => {
+        const topic = (f.topic ?? f.id ?? "").toString().toLowerCase();
+        if (!topic) return null;
+        return {
+          topic,
+          pricePerKB: Number(f.priceAtomic ?? f.pricePerKB ?? 0) || 0,
+          provenance: (f.provenance ?? "").toString() || "first-party",
+        };
+      })
+      .filter((f: GatewayFeed | null): f is GatewayFeed => f !== null);
   } catch {
-    return new Set();
+    return [];
   }
 }
 
@@ -212,10 +234,18 @@ const DELISTED_TOPICS = new Set([
  * with on-chain data.
  */
 export async function getFeeds(): Promise<DiscoveryResponse> {
-  const [indexerData, x402Topics] = await Promise.all([
-    fetchFromIndexer("/publishers"),
-    fetchX402Topics(),
+  // Fix A: request the full publisher page. The indexer's default page size is
+  // 20 but it holds 24 publishers, so the unpaginated call truncated the list
+  // (dropping `earthquakes`, a live feed) and caused the 15↔16 discover flap.
+  const [indexerData, gatewayFeeds] = await Promise.all([
+    fetchFromIndexer("/publishers?limit=200"),
+    fetchX402Feeds(),
   ]);
+
+  // Topics the gateway fronts (for the x402 endpoint decoration) + a lookup for
+  // gateway-advertised provenance.
+  const x402Topics = new Set(gatewayFeeds.map((f) => f.topic));
+  const gatewayByTopic = new Map(gatewayFeeds.map((f) => [f.topic, f]));
 
   let feeds: Feed[] = [];
   let totalMessages = 0;
@@ -236,6 +266,10 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
         frequencySeconds: onChain.frequencySeconds,
         subscribers: onChain.subscribers,
         messages: onChain.messages,
+        provenance:
+          gatewayByTopic.get((onChain.topic || "").toLowerCase())?.provenance ??
+          "on-chain",
+        onchain: address,
         endpoints: buildEndpoints(onChain.topic, x402Topics),
       } satisfies Feed;
     });
@@ -273,6 +307,10 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
             frequencySeconds: onChain.frequencySeconds,
             subscribers: onChain.subscribers,
             messages: onChain.messages,
+            provenance:
+              gatewayByTopic.get((onChain.topic || "").toLowerCase())
+                ?.provenance ?? "on-chain",
+            onchain: address as string,
             endpoints: buildEndpoints(onChain.topic, x402Topics),
           });
         } catch {
@@ -288,6 +326,35 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
   // catalog reflects the LIVE product (not retired/superseded feeds). Recompute
   // the message total over the surviving feeds.
   feeds = feeds.filter((f) => !DELISTED_TOPICS.has((f.topic || "").toLowerCase()));
+
+  // Fix B: surface first-party gateway-only oracles. These feeds (address-
+  // reputation, pkg-verdict, sanctions-screen, reasoning-verdict,
+  // liquidation-stream, positioning-snapshot) are live + billable via x402 but
+  // have NO on-chain DataRegistry publisher, so the indexer/chain enumeration
+  // above never includes them. Merge in any gateway feed not already present and
+  // not delisted — marked HONESTLY as first-party with onchain=null; we never
+  // fake an on-chain publisher address. Result: /discover == /feeds == 22.
+  const present = new Set(feeds.map((f) => (f.topic || "").toLowerCase()));
+  for (const gf of gatewayFeeds) {
+    if (present.has(gf.topic) || DELISTED_TOPICS.has(gf.topic)) continue;
+    feeds.push({
+      publisher: "first-party",
+      topic: gf.topic,
+      pricePerKB: gf.pricePerKB,
+      frequencySeconds: 0,
+      subscribers: 0,
+      messages: 0,
+      provenance: gf.provenance || "first-party",
+      onchain: null,
+      endpoints: {
+        mcp: "byte_subscribe",
+        onchain: "", // no on-chain publisher for a gateway-only first-party feed
+        x402: `${config.x402Gateway}/feeds/${gf.topic}`,
+      },
+    });
+    present.add(gf.topic);
+  }
+
   totalMessages = feeds.reduce((sum, f) => sum + f.messages, 0);
 
   return {
