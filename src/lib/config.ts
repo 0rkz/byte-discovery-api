@@ -16,6 +16,27 @@ export const config = {
   chainId: 421614,
   chain: "arbitrum-sepolia",
 
+  // Two DISTINCT chains — clients must not conflate them:
+  //  • payment  — where USDC settles (x402 "exact" on Base mainnet). This is the
+  //    chain a buyer routes funds to; it is the network in every 402 challenge.
+  //  • attestation — the consensus-critical EIP-712 "BYTE Library" anchor chain.
+  //    Receipts verify against THIS chain/contract regardless of settlement rail.
+  payment: {
+    network: "eip155:8453",
+    chain: "base",
+    chainId: 8453,
+    asset: "USDC",
+    usdcAddress: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    payTo: "0xffFf4B8Da8C165B556326453446F6940C8AFE0DB",
+  },
+  attestation: {
+    network: "eip155:421614",
+    chain: "arbitrum-sepolia",
+    chainId: 421614,
+    domain: "BYTE Library",
+    verifyingContract: "0x44729bB148F46d8Db509E47b0453edc271e06e95",
+  },
+
   // BYTE Library v1 — deploy block on Arbitrum Sepolia (chain 421614).
   // Source: byte-protocol-contracts/deployments/arbitrum-sepolia.json "byte-library".
   deployBlock: 270092067,

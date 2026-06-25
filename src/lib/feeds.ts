@@ -45,8 +45,28 @@ export interface Feed {
 export interface DiscoveryResponse {
   protocol: string;
   version: string;
+  /** The BYTE Library protocol / attestation-anchor chain (NOT the payment
+   *  chain). Kept for back-compat; route USDC by `payment` below. */
   chain: string;
   chainId: number;
+  /** USDC settlement rail — where a buyer ROUTES funds (Base mainnet). */
+  payment: {
+    network: string;
+    chain: string;
+    chainId: number;
+    asset: string;
+    usdcAddress: string;
+    payTo: string;
+  };
+  /** EIP-712 receipt anchor — verify receipts against THIS chain/contract,
+   *  regardless of the settlement rail above. */
+  attestation: {
+    network: string;
+    chain: string;
+    chainId: number;
+    domain: string;
+    verifyingContract: string;
+  };
   totalPublishers: number;
   totalMessages: number;
   feeds: Feed[];
@@ -362,6 +382,8 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
     version: "1.0",
     chain: config.chain,
     chainId: config.chainId,
+    payment: config.payment,
+    attestation: config.attestation,
     totalPublishers: feeds.length,
     totalMessages,
     feeds,
