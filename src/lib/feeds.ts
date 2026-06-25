@@ -157,7 +157,7 @@ function buildEndpoints(
   x402Topics: Set<string>
 ): Feed["endpoints"] {
   const endpoints: Feed["endpoints"] = {
-    mcp: "byte_subscribe",
+    mcp: "byte_buy_data",
     onchain: contracts.DataStream,
   };
   if (x402Topics.has(topic.toLowerCase())) {
@@ -367,7 +367,7 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
       provenance: gf.provenance || "first-party",
       onchain: null,
       endpoints: {
-        mcp: "byte_subscribe",
+        mcp: "byte_buy_data",
         onchain: "", // no on-chain publisher for a gateway-only first-party feed
         x402: `${config.x402Gateway}/feeds/${gf.topic}`,
       },
@@ -389,7 +389,7 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
     feeds,
     access: {
       x402_gateway: config.x402Gateway,
-      mcp_server: "npx byte-mcp-server",
+      mcp_server: "https://mcp.payperbyte.io/mcp",
       indexer_api: config.indexerUrl,
     },
   };
