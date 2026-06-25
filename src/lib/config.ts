@@ -35,6 +35,7 @@ export const config = {
     chainId: 421614,
     domain: "BYTE Library",
     verifyingContract: "0x44729bB148F46d8Db509E47b0453edc271e06e95",
+    note: "chainId 421614 (Arbitrum Sepolia testnet) is a FROZEN EIP-712 signing namespace for receipt signature recovery — NOT a fund rail. USDC settles on Base mainnet (see `payment` above); no funds move on testnet. The chainId stays 421614 regardless of settlement rail so every receipt verifies against the same domain. Mainnet re-anchoring is audit-gated.",
   },
 
   // BYTE Library v1 — deploy block on Arbitrum Sepolia (chain 421614).

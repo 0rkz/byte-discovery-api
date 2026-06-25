@@ -66,6 +66,9 @@ export interface DiscoveryResponse {
     chainId: number;
     domain: string;
     verifyingContract: string;
+    /** Plain-language explanation of the testnet chainId vs the mainnet fund rail
+     *  — so a client does not read 421614 as a place funds move. */
+    note: string;
   };
   totalPublishers: number;
   totalMessages: number;
