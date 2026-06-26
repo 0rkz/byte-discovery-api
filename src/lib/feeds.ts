@@ -70,7 +70,12 @@ export interface DiscoveryResponse {
      *  — so a client does not read 421614 as a place funds move. */
     note: string;
   };
-  totalPublishers: number;
+  /** Count of feed topics (was misnamed `totalPublishers` — these are feeds, not
+   *  independent orgs). The honest distinct-operator count is `distinctOperators`. */
+  totalFeeds: number;
+  /** Distinct operating organizations behind the feeds: 1 — all first-party PayPerByte
+   *  (the per-feed publisher addresses are PayPerByte-operated keys, not third parties). */
+  distinctOperators: number;
   totalMessages: number;
   feeds: Feed[];
   access: {
@@ -387,7 +392,8 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
     chainId: config.chainId,
     payment: config.payment,
     attestation: config.attestation,
-    totalPublishers: feeds.length,
+    totalFeeds: feeds.length,
+    distinctOperators: 1, // all first-party PayPerByte — not independent orgs
     totalMessages,
     feeds,
     access: {
