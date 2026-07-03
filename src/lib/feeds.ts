@@ -255,6 +255,20 @@ const DELISTED_TOPICS = new Set([
   "cve-facts", // superseded by threat-intel
   "wiki-facts", // retired
   "bridge-flow", // retired
+  // ── concentration cut 2026-07-03 (11 off-thesis feeds; keep-both retained
+  //    runtime-eol + threat-intel, so they are NOT delisted). Mirrors the
+  //    gateway feedRegistry cut (x402-gateway 499c7e1). ──
+  "defi-yields",
+  "space-weather",
+  "news-feed",
+  "code-pulse",
+  "x402-pulse",
+  "stablecoin-rails",
+  "perp-funding",
+  "usc-statute",
+  "agent-compute",
+  "agent-memory",
+  "agent-tools",
 ]);
 
 /**
