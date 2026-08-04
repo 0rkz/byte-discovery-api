@@ -309,6 +309,47 @@ async function main() {
   check("  and it IS purchasable (on-chain entry correctly matched the gateway feed)",
     servedMatches[0] && servedMatches[0].purchasable === true, servedMatches);
 
+  // ───────────────────────────────────────────────────────────────────────
+  // Section 6 (FD ruling, A6, 2026-08-04): the Fix B merge's emitted `topic`
+  // field must be normalizeTopic()'d, not raw gf.topic — the Feed type
+  // above (line ~145) already documents `topic: string; // lowercased slug`,
+  // so emitting the gateway's raw casing broke that contract on every
+  // response this merge touches. The x402 URL stays on the RAW topic on
+  // purpose (a route, not an identity) — normalizing IT would be the actual
+  // bug.
+  // SAME honest caveat as Sections 4/5, sharper here: fetchX402Feeds()
+  // normalizeTopic()'s the topic BEFORE it is ever stored on GatewayFeed
+  // (feeds.ts ~line 175) — gatewayFeeds is populated EXCLUSIVELY through
+  // that one call site (verified: `gatewayFeeds` has exactly one producer in
+  // getFeeds()), so by the time this loop runs, gf.topic is ALREADY
+  // lowercase. That means an end-to-end test through the mocked HTTP
+  // gateway response cannot, even in principle, distinguish "fixed" from
+  // "reverted" for THIS specific line — worse than Sections 4/5, where the
+  // upstream normalization was merely redundant with the downstream fix; here
+  // it fully PRE-EMPTS it, so a mixed-case string in mockGatewayFeeds below
+  // arrives at line ~462 already lowercased regardless of what this test
+  // does. It also means the x402 URL's "byte-for-byte gateway casing" claim
+  // is untestable through this path for the same reason (it's already been
+  // lowercased by fetchX402Feeds() before it ever reaches the URL). The
+  // genuine revert proof — reverting fetchX402Feeds()'s OWN normalization
+  // (simulating that upstream safeguard broken) and confirming the Fix B
+  // topic-field normalization independently catches it, WHILE the x402 URL
+  // correctly preserves whatever raw casing the gateway supplied in that
+  // scenario — was run against the compiled dist/, not here; reported
+  // separately, not asserted by this suite.
+  // ───────────────────────────────────────────────────────────────────────
+  console.log("\n── Fix B: emitted topic field is normalized even though it's currently unreachable mixed-case ──");
+  mockPublishers = [];
+  mockIndexerPublishers = [];
+  mockGatewayFeeds = [{ topic: "Brand-New-Oracle", priceAtomic: 50000, provenance: "first-party" }]; // gateway-only, no on-chain match
+  const newOracleDiscovery = await getFeeds();
+  const newOracleEntry = newOracleDiscovery.feeds.find((f) => (f.topic || "").toLowerCase() === "brand-new-oracle");
+  check("emitted topic field is exactly lowercase, never the mixed-case original",
+    newOracleEntry && newOracleEntry.topic === "brand-new-oracle", newOracleEntry);
+  check("  x402 URL is present and resolves this feed (route correctness is verified separately against dist/)",
+    newOracleEntry && typeof newOracleEntry.endpoints.x402 === "string" && newOracleEntry.endpoints.x402.length > 0,
+    newOracleEntry);
+
   console.log(`\n${"=".repeat(60)}\n${PASS} passed, ${FAIL} failed`);
   global.fetch = realFetch;
   viemModule.createPublicClient = realCreatePublicClient;

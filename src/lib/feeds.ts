@@ -126,7 +126,27 @@ function decodeTopic(hex: string): string {
  * these three.
  */
 function normalizeTopic(topic: string | null | undefined): string {
-  return (topic || "").toLowerCase();
+  // String(topic ?? ""), not `topic || ""`: a non-string topic from parsed
+  // JSON (a stray number, e.g.) makes `topic || ""` return the NUMBER itself
+  // (`5 || ""` is `5`), and `.toLowerCase()` on that throws — taking the
+  // endpoint down rather than degrading. 12 of 13 call sites pass parsed JSON
+  // straight through with no .toString() guard (FD, A6). Fails LOUD either
+  // way, which is the safe direction, but String(x ?? "") gets the same
+  // safety without the crash.
+  //
+  // Signature stays `string | null | undefined`, NOT widened to `unknown`
+  // (FD's required correction, A6): the coercion and the widening are
+  // separable, and only one pays for anything. The one place a non-string
+  // topic can actually originate is fetchX402Feeds()'s `.map((f: any) => ...)`
+  // — `any` is assignable to `string` regardless of this parameter's declared
+  // type, so the narrow signature never protected that boundary and widening
+  // it buys nothing there. It WOULD surrender the guard that protects every
+  // other call site (a developer passing a genuinely-mistyped value) for no
+  // gain. If a non-string topic ever needs handling for real, this file
+  // already has the right pattern one line below fetchX402Feeds's own
+  // extraction: `if (!topic) return null;` — skip the malformed feed,
+  // fail closed, don't coerce-and-continue.
+  return String(topic ?? "").toLowerCase();
 }
 
 /** Fetch JSON from the BYTE Library indexer, returning null on any failure. */
@@ -459,7 +479,22 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
     if (present.has(normalizeTopic(gf.topic)) || DELISTED_TOPICS.has(normalizeTopic(gf.topic))) continue;
     feeds.push({
       publisher: "first-party",
-      topic: gf.topic,
+      // normalizeTopic()'d, not raw gf.topic (FD, A6 — 2026-08-04): the
+      // Feed type above (line ~145) already documents `topic: string; //
+      // lowercased slug` — emitting the gateway's raw, possibly-mixed-case
+      // topic here violated that contract on every response this merge ever
+      // touched. Normalizing is the fix, not relaxing the comment: every
+      // downstream consumer of this field does its own topic-set maths
+      // (ops/scripts/discover-gateway-consistency-check.cjs is the immediate
+      // example), so an un-normalized emission forces each one to reimplement
+      // normalizeTopic() itself — the exact scattered-`.toLowerCase()` defect
+      // this file closed one level down, just pushed across the module
+      // boundary instead of staying inside it. Costs no fidelity: the x402
+      // URL two lines below already uses the RAW gf.topic on purpose (it's a
+      // route, not an identity) — this is the same exact-string-for-routes /
+      // normalized-string-for-identity split the file already made, now
+      // applied consistently to the field it names as an identity.
+      topic: normalizeTopic(gf.topic),
       pricePerKB: gf.pricePerKB,
       frequencySeconds: 0,
       subscribers: 0,
@@ -473,6 +508,9 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
       endpoints: {
         mcp: "byte_buy_data",
         onchain: "", // no on-chain publisher for a gateway-only first-party feed
+        // RAW gf.topic, deliberately NOT normalized — this builds a ROUTE the
+        // gateway must match byte-for-byte, unlike `topic` above (an identity
+        // field, always normalized). Do not "fix" this to normalizeTopic().
         x402: `${config.x402Gateway}/feeds/${gf.topic}`,
       },
     });
