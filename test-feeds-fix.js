@@ -1,0 +1,249 @@
+/**
+ * Verification for the 2026-08-04 fix: "registered != purchasable".
+ *
+ * No test framework exists in this repo (checked: package.json has no test
+ * script, no *.test.* files anywhere under src/). This drives the REAL
+ * getFeeds() and buildEndpoints() end-to-end against the COMPILED build
+ * (dist/lib/feeds.js — what actually runs in production, `node dist/index.js`)
+ * — not extracted logic fragments — by mocking viem's createPublicClient
+ * (module-mutation via `require`, BEFORE feeds.js is first required, so its
+ * own `require("viem")` captures the mock) and global.fetch (for the
+ * indexer + gateway calls). No real network call is made.
+ *
+ * Plain JS, not TS: raw ts-node against this repo's src/*.ts cannot resolve
+ * the .js-suffixed internal imports at runtime (confirmed pre-existing —
+ * even `npm run dev` fails the same way; tsc's own NodeNext-style extension
+ * resolution only works for its OWN compiled output, not ts-node's direct
+ * pass-through). Testing against dist/ sidesteps that entirely and is
+ * arguably more honest anyway: it is what actually ships.
+ *
+ * Run:
+ *   cd discovery-api && npm run build && node test-feeds-fix.js
+ */
+
+let PASS = 0;
+let FAIL = 0;
+function check(name, cond, detail) {
+  if (cond) {
+    PASS++;
+    console.log(`  ok   ${name}`);
+  } else {
+    FAIL++;
+    console.log(`  FAIL ${name}  <- ${detail !== undefined ? JSON.stringify(detail) : ""}`);
+  }
+}
+
+// ── topic <-> bytes32 hex, matching feeds.ts's decodeTopic exactly ──────────
+function topicToHex(topic) {
+  const bytes = Buffer.from(topic, "ascii");
+  if (bytes.length > 32) throw new Error(`topic too long: ${topic}`);
+  const padded = Buffer.concat([bytes, Buffer.alloc(32 - bytes.length)]);
+  return "0x" + padded.toString("hex");
+}
+
+// ── mock viem BEFORE feeds.js is ever required ──────────────────────────────
+let mockPublishers = [];
+let mockPublisherListOrder = [];
+
+const viemModule = require("viem");
+const realCreatePublicClient = viemModule.createPublicClient;
+// viem is published ESM; under Node's cjs-esm interop the namespace object
+// exposes each export as a getter-only accessor, so a plain assignment
+// throws ("has only a getter"). The property IS configurable (checked via
+// Object.getOwnPropertyDescriptor), so replace it with a plain writable
+// data property instead.
+Object.defineProperty(viemModule, "createPublicClient", {
+  value: (_args) => ({
+    readContract: async ({ functionName, args }) => {
+      const byAddress = new Map(mockPublishers.map((p) => [p.address.toLowerCase(), p]));
+      if (functionName === "getPublisher") {
+        const addr = (args[0] || "").toLowerCase();
+        const p = byAddress.get(addr);
+        if (!p) throw new Error(`mock RPC: no publisher registered at ${addr}`);
+        return {
+          status: p.status,
+          tier: 0,
+          stakedAmount: 0n,
+          sandboxStartTime: 0n,
+          registeredAt: 0n,
+          subscriberCount: p.subscriberCount,
+          messageCount: p.messageCount,
+          totalRevenue: 0n,
+          lastActiveTimestamp: 0n,
+          publicKey: "0x" + "00".repeat(32),
+          slashCount: 0n,
+        };
+      }
+      if (functionName === "getSchema") {
+        const addr = (args[0] || "").toLowerCase();
+        const p = byAddress.get(addr);
+        if (!p || !p.schema) {
+          return {
+            expectedSize: 0, maxSize: 0, frequencySeconds: 0, pubClass: 0, verType: 0,
+            methodologyHash: "0x" + "00".repeat(32), topic: "0x" + "00".repeat(32),
+            pricePerKB: 0n, active: false, registeredAt: 0n,
+          };
+        }
+        return {
+          expectedSize: 4096, maxSize: 65536, frequencySeconds: p.schema.frequencySeconds,
+          pubClass: 0, verType: 0, methodologyHash: "0x" + "11".repeat(32),
+          topic: p.schema.topicHex, pricePerKB: p.schema.pricePerKB, active: p.schema.active,
+          registeredAt: 0n,
+        };
+      }
+      if (functionName === "getPublisherListLength") {
+        return BigInt(mockPublisherListOrder.length);
+      }
+      if (functionName === "publisherList") {
+        const i = Number(args[0]);
+        return mockPublisherListOrder[i];
+      }
+      throw new Error(`mock RPC: unhandled functionName ${functionName}`);
+    },
+  }),
+  writable: true,
+  configurable: true,
+});
+
+// ── mock global.fetch for the indexer + gateway calls ───────────────────────
+let mockIndexerPublishers = null; // null -> indexer "down", forces fallback path
+let mockGatewayFeeds = [];
+
+const realFetch = global.fetch;
+global.fetch = async (url) => {
+  if (url.includes("/publishers?limit=200")) {
+    if (mockIndexerPublishers === null) return { ok: false };
+    return { ok: true, json: async () => mockIndexerPublishers };
+  }
+  if (url.endsWith("/feeds")) {
+    return { ok: true, json: async () => ({ feeds: mockGatewayFeeds }) };
+  }
+  throw new Error(`mock fetch: unhandled URL ${url}`);
+};
+
+// NOW require the COMPILED feeds.js — its own require("viem") resolves to
+// the SAME (already-mutated) cached module object.
+const { getFeeds, buildEndpoints } = require("./dist/lib/feeds.js");
+
+async function main() {
+  // ───────────────────────────────────────────────────────────────────────
+  // Section 1: buildEndpoints() directly — the exact function that changed.
+  // ───────────────────────────────────────────────────────────────────────
+  console.log("\n── buildEndpoints(): served vs not-served ──");
+  const served = buildEndpoints("test-served", new Set(["test-served"]));
+  check("served topic: mcp is present", served.mcp === "byte_buy_data", served);
+  check("served topic: x402 is present", typeof served.x402 === "string" && served.x402.length > 0, served);
+  check("served topic: onchain is always present", typeof served.onchain === "string" && served.onchain.length > 0, served);
+
+  const notServed = buildEndpoints("test-not-served", new Set(["test-served"]));
+  check("NOT-served topic: mcp key is ABSENT (not just falsy)", !("mcp" in notServed), notServed);
+  check("NOT-served topic: x402 key is ABSENT", !("x402" in notServed), notServed);
+  check("NOT-served topic: onchain is STILL present", typeof notServed.onchain === "string" && notServed.onchain.length > 0, notServed);
+
+  const mixedCase = buildEndpoints("Test-Served", new Set(["test-served"]));
+  check("buildEndpoints matches case-insensitively", mixedCase.mcp === "byte_buy_data", mixedCase);
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Section 2: getFeeds() end-to-end — indexer path, five cases at once.
+  // ───────────────────────────────────────────────────────────────────────
+  console.log("\n── getFeeds() via the indexer path: 5 realistic cases in one batch ──");
+  const ADDR_SERVED = "0x1111111111111111111111111111111111111a";
+  const ADDR_NOT_SERVED = "0x2222222222222222222222222222222222222b";
+  const ADDR_EVIDENCE_PACK = "0x3333333333333333333333333333333333333c";
+  const ADDR_DELISTED = "0x4444444444444444444444444444444444444d";
+
+  mockPublishers = [
+    { address: ADDR_SERVED, status: 1, subscriberCount: 2n, messageCount: 10n,
+      schema: { frequencySeconds: 300, topicHex: topicToHex("test-served"), pricePerKB: 100000n, active: true } },
+    { address: ADDR_NOT_SERVED, status: 1, subscriberCount: 0n, messageCount: 0n,
+      schema: { frequencySeconds: 3600, topicHex: topicToHex("test-not-served"), pricePerKB: 100000n, active: true } },
+    // The REAL historical bug shape: registered on-chain, removed from the
+    // gateway, but never added to DELISTED_TOPICS — must still APPEAR, just
+    // without a working buy verb.
+    { address: ADDR_EVIDENCE_PACK, status: 1, subscriberCount: 5n, messageCount: 200n,
+      schema: { frequencySeconds: 3600, topicHex: topicToHex("evidence-pack"), pricePerKB: 3000n, active: true } },
+    // A REAL DELISTED_TOPICS entry — must be filtered OUT entirely regardless
+    // of gateway/on-chain status, proving the (untouched) delisting path
+    // still works after this fix.
+    { address: ADDR_DELISTED, status: 1, subscriberCount: 1n, messageCount: 1n,
+      schema: { frequencySeconds: 3600, topicHex: topicToHex("crypto-top100"), pricePerKB: 3000n, active: true } },
+  ];
+  mockIndexerPublishers = mockPublishers.map((p) => ({ address: p.address }));
+  mockGatewayFeeds = [
+    { topic: "test-served", priceAtomic: 100000, provenance: "first-party" },
+    { topic: "test-gateway-only", priceAtomic: 5000, provenance: "first-party" },
+    // deliberately NOT listing "test-not-served" or "evidence-pack" — that IS
+    // the bug shape (removed from / never fronted by the gateway).
+  ];
+
+  const discovery = await getFeeds();
+  const byTopic = new Map(discovery.feeds.map((f) => [f.topic, f]));
+
+  const servedFeed = byTopic.get("test-served");
+  check("SERVED feed is present", !!servedFeed);
+  check("  purchasable: true", servedFeed && servedFeed.purchasable === true, servedFeed);
+  check("  endpoints.mcp present", servedFeed && servedFeed.endpoints.mcp === "byte_buy_data", servedFeed);
+  check("  endpoints.x402 present", servedFeed && typeof servedFeed.endpoints.x402 === "string", servedFeed);
+  check("  endpoints.onchain present (unchanged)", servedFeed && typeof servedFeed.endpoints.onchain === "string" && servedFeed.endpoints.onchain.length > 0, servedFeed);
+  check("  onchain publisher address is set (unchanged)", servedFeed && servedFeed.onchain === ADDR_SERVED, servedFeed);
+
+  const notServedFeed = byTopic.get("test-not-served");
+  check("NOT-SERVED feed is STILL PRESENT (registered on-chain, just not purchasable)", !!notServedFeed);
+  check("  purchasable: false", notServedFeed && notServedFeed.purchasable === false, notServedFeed);
+  check("  endpoints.mcp is ABSENT", notServedFeed && !("mcp" in notServedFeed.endpoints), notServedFeed);
+  check("  endpoints.x402 is ABSENT", notServedFeed && !("x402" in notServedFeed.endpoints), notServedFeed);
+  check("  endpoints.onchain is STILL present", notServedFeed && typeof notServedFeed.endpoints.onchain === "string" && notServedFeed.endpoints.onchain.length > 0, notServedFeed);
+
+  const evidencePackFeed = byTopic.get("evidence-pack");
+  check("EVIDENCE-PACK SHAPE: still present (not in DELISTED_TOPICS)", !!evidencePackFeed);
+  check("  purchasable: false (this is the 2026-07-28 bug this fix closes)", evidencePackFeed && evidencePackFeed.purchasable === false, evidencePackFeed);
+  check("  endpoints.mcp is ABSENT — no more false buy verb", evidencePackFeed && !("mcp" in evidencePackFeed.endpoints), evidencePackFeed);
+  check("  endpoints.x402 is ABSENT (was ALREADY correctly absent before this fix)", evidencePackFeed && !("x402" in evidencePackFeed.endpoints), evidencePackFeed);
+
+  check("DELISTED topic (crypto-top100) is COMPLETELY ABSENT — delisting filter unaffected by this fix",
+    !byTopic.has("crypto-top100"));
+
+  const gatewayOnlyFeed = byTopic.get("test-gateway-only");
+  check("GATEWAY-ONLY feed (no on-chain publisher) is present via the merge", !!gatewayOnlyFeed);
+  check("  purchasable: true (always, by construction)", gatewayOnlyFeed && gatewayOnlyFeed.purchasable === true, gatewayOnlyFeed);
+  check("  onchain is null (never faked)", gatewayOnlyFeed && gatewayOnlyFeed.onchain === null, gatewayOnlyFeed);
+  check("  endpoints.mcp present", gatewayOnlyFeed && gatewayOnlyFeed.endpoints.mcp === "byte_buy_data", gatewayOnlyFeed);
+  check("  endpoints.x402 present", gatewayOnlyFeed && typeof gatewayOnlyFeed.endpoints.x402 === "string", gatewayOnlyFeed);
+
+  console.log("\n── exact before/after JSON, as requested ──");
+  console.log("SERVED feed (test-served) full JSON:");
+  console.log(JSON.stringify(servedFeed, null, 2));
+  console.log("\nNOT-SERVED feed (test-not-served) full JSON:");
+  console.log(JSON.stringify(notServedFeed, null, 2));
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Section 3: same served/not-served pair via the FALLBACK (direct-chain
+  // enumeration) path — proves parity, since this fix touches BOTH emit
+  // sites identically.
+  // ───────────────────────────────────────────────────────────────────────
+  console.log("\n── getFeeds() via the FALLBACK path (indexer down) — same two cases ──");
+  mockIndexerPublishers = null; // force the fallback branch
+  mockPublisherListOrder = [ADDR_SERVED, ADDR_NOT_SERVED];
+  mockPublishers = mockPublishers.slice(0, 2); // just the served + not-served pair
+
+  const fallbackDiscovery = await getFeeds();
+  const fallbackByTopic = new Map(fallbackDiscovery.feeds.map((f) => [f.topic, f]));
+  const fbServed = fallbackByTopic.get("test-served");
+  const fbNotServed = fallbackByTopic.get("test-not-served");
+  check("fallback path: served feed purchasable=true, mcp+x402 present",
+    fbServed && fbServed.purchasable === true && fbServed.endpoints.mcp === "byte_buy_data" && typeof fbServed.endpoints.x402 === "string",
+    fbServed);
+  check("fallback path: not-served feed purchasable=false, NO mcp, NO x402",
+    fbNotServed && fbNotServed.purchasable === false && !("mcp" in fbNotServed.endpoints) && !("x402" in fbNotServed.endpoints),
+    fbNotServed);
+
+  console.log(`\n${"=".repeat(60)}\n${PASS} passed, ${FAIL} failed`);
+  global.fetch = realFetch;
+  viemModule.createPublicClient = realCreatePublicClient;
+  process.exit(FAIL ? 1 : 0);
+}
+
+main().catch((err) => {
+  console.error("TEST HARNESS CRASHED:", err);
+  process.exit(1);
+});

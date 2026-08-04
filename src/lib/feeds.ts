@@ -34,9 +34,15 @@ export interface Feed {
   /** On-chain DataRegistry publisher address, or null for gateway-only
    *  first-party oracles (which have no on-chain publisher — never faked). */
   onchain: string | null;
+  /** Whether this feed can actually be bought right now (the gateway fronts
+   *  it — `x402Topics.has(topic)`). An on-chain SchemaRegistry registration
+   *  is NOT a purchase route: registerSchema commits a schema on-chain, but
+   *  buying data goes through the x402 gateway, and a feed can be registered
+   *  without ever being fronted there (2026-08-04 fix — see buildEndpoints). */
+  purchasable: boolean;
   endpoints: {
     x402?: string;
-    mcp: string;
+    mcp?: string;
     onchain: string;
   };
 }
@@ -157,18 +163,37 @@ async function fetchX402Feeds(): Promise<GatewayFeed[]> {
 }
 
 /**
- * Build a feed's access endpoints. `mcp` and `onchain` always apply; `x402` is
- * included only when the gateway serves that topic.
+ * Build a feed's access endpoints. `onchain` always applies; `mcp` AND
+ * `x402` are BOTH gated on the gateway actually fronting this topic
+ * (2026-08-04 fix — registered != purchasable, founder GO).
+ *
+ * Why mcp is gated now, not just x402: the MCP tool `byte_buy_data`
+ * (mcp-server/src/tools/buy.ts) resolves its documented step 1 to
+ * `GET {x402Gateway}/feeds/<slug>` — the EXACT route x402Topics decides. A
+ * topic registered on-chain (SchemaRegistry) but not fronted by the gateway
+ * has no working buy route at all, so advertising `mcp: "byte_buy_data"`
+ * for it handed agents a buy verb for something unbuyable. The failure
+ * lands on the UNPAID probe leg of that tool (its own comment: "nothing has
+ * been signed and no money is at risk") — a false catalog claim, not a
+ * payment hazard.
+ *
+ * Three live cases this closes: signature-screen and cctp-attestation-latency
+ * (registered 2026-08-04, never fronted by the gateway) and — the
+ * pre-existing one this same fix reaches — evidence-pack, removed from the
+ * gateway 2026-07-28 for an integrity violation but never added to
+ * DELISTED_TOPICS below, so it kept advertising `mcp: "byte_buy_data"` for
+ * ten days on the strength of this exact gap (x402 was already correctly
+ * gated; mcp was not).
  */
-function buildEndpoints(
+export function buildEndpoints(
   topic: string,
   x402Topics: Set<string>
 ): Feed["endpoints"] {
   const endpoints: Feed["endpoints"] = {
-    mcp: "byte_buy_data",
     onchain: contracts.DataStream,
   };
   if (x402Topics.has(topic.toLowerCase())) {
+    endpoints.mcp = "byte_buy_data";
     endpoints.x402 = `${config.x402Gateway}/feeds/${topic}`;
   }
   return endpoints;
@@ -312,6 +337,11 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
           gatewayByTopic.get((onChain.topic || "").toLowerCase())?.provenance ??
           "on-chain",
         onchain: address,
+        // Registered on-chain != fronted by the gateway (2026-08-04 fix) —
+        // same check buildEndpoints uses to gate mcp/x402, computed here too
+        // so `purchasable` is an explicit signal, not inferred from whether
+        // `endpoints.mcp` happens to be present.
+        purchasable: x402Topics.has((onChain.topic || "").toLowerCase()),
         endpoints: buildEndpoints(onChain.topic, x402Topics),
       } satisfies Feed;
     });
@@ -353,6 +383,9 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
               gatewayByTopic.get((onChain.topic || "").toLowerCase())
                 ?.provenance ?? "on-chain",
             onchain: address as string,
+            // Registered on-chain != fronted by the gateway — see the
+            // indexer-driven path above for the full note.
+            purchasable: x402Topics.has((onChain.topic || "").toLowerCase()),
             endpoints: buildEndpoints(onChain.topic, x402Topics),
           });
         } catch {
@@ -388,6 +421,10 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
       messages: 0,
       provenance: gf.provenance || "first-party",
       onchain: null,
+      // This merge only ever runs for topics IN gatewayFeeds (the loop guard
+      // above), so every feed reaching this line is, by construction,
+      // fronted by the gateway right now — always purchasable.
+      purchasable: true,
       endpoints: {
         mcp: "byte_buy_data",
         onchain: "", // no on-chain publisher for a gateway-only first-party feed
