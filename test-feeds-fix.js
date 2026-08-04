@@ -237,6 +237,78 @@ async function main() {
     fbNotServed && fbNotServed.purchasable === false && !("mcp" in fbNotServed.endpoints) && !("x402" in fbNotServed.endpoints),
     fbNotServed);
 
+  // ───────────────────────────────────────────────────────────────────────
+  // Section 4: mixed-case gateway topic (FD LOW, 2026-08-04). x402Topics/
+  // gatewayByTopic are now lowercased AT CONSTRUCTION (feeds.ts:314-315),
+  // not just relied upon from fetchX402Feeds()'s own normalization. Honest
+  // caveat: fetchX402Feeds() ALREADY lowercases every topic/id it reads off
+  // the raw gateway JSON (line ~151), so this end-to-end test cannot, by
+  // itself, isolate "would this have failed without the feeds.ts:314-315
+  // fix" — that upstream normalization means it never could, through this
+  // public interface. What it DOES prove is the thing that actually matters
+  // to a consumer: a mixed-case topic in the RAW gateway response still
+  // resolves to a correct, matching buy affordance end-to-end. The
+  // construction-site fix itself is deliberately redundant defense — it
+  // removes an IMPLICIT cross-function contract (this file trusting
+  // fetchX402Feeds forever normalizes) in favor of a local guarantee, per
+  // FD's finding, not because this test can catch its absence.
+  // ───────────────────────────────────────────────────────────────────────
+  console.log("\n── mixed-case gateway topic still resolves to a matching buy affordance ──");
+  mockIndexerPublishers = mockPublishers.map((p) => ({ address: p.address })); // back to indexer path
+  mockGatewayFeeds = [
+    { topic: "Test-Served", priceAtomic: 100000, provenance: "first-party" }, // MIXED CASE in the raw response
+  ];
+  const mixedCaseDiscovery = await getFeeds();
+  const mixedCaseServed = mixedCaseDiscovery.feeds.find((f) => f.topic === "test-served");
+  check("mixed-case gateway topic -> the (lowercase) discover topic is still purchasable",
+    mixedCaseServed && mixedCaseServed.purchasable === true, mixedCaseServed);
+  check("  endpoints.mcp present despite the gateway's raw topic being mixed-case",
+    mixedCaseServed && mixedCaseServed.endpoints.mcp === "byte_buy_data", mixedCaseServed);
+  check("  endpoints.x402 present too",
+    mixedCaseServed && typeof mixedCaseServed.endpoints.x402 === "string", mixedCaseServed);
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Section 5: Site 1 (FD + team lead, 2026-08-04) — the Fix B merge's
+  // `present.has(gf.topic) || DELISTED_TOPICS.has(gf.topic)` used a RAW,
+  // un-normalized needle against two lowercase-normalized haystacks. Same
+  // honest caveat as Section 4: fetchX402Feeds() ALREADY normalizes every
+  // topic/id off the raw gateway JSON before it ever becomes part of
+  // `gatewayFeeds` (verified directly, feeds.ts ~line 168), so these
+  // end-to-end tests — mixed case in the RAW mocked HTTP response — cannot,
+  // by themselves, distinguish "fixed" from "reverted": both layers already
+  // normalize today, and either alone would make these pass. See the
+  // SEPARATE two-stage revert proof below (against the compiled dist/) for
+  // what actually isolates the defense-in-depth property FD asked to prove.
+  // ───────────────────────────────────────────────────────────────────────
+  console.log("\n── Site 1: mixed-case gateway topic already delisted must NOT appear ──");
+  mockPublishers = [];
+  mockIndexerPublishers = [];
+  mockGatewayFeeds = [{ topic: "Crypto-Top100", priceAtomic: 100, provenance: "first-party" }]; // real DELISTED_TOPICS entry, mixed case
+  const delistedDiscovery = await getFeeds();
+  // NOTE: a leaked entry keeps gf.topic's ORIGINAL casing (feeds.ts pushes
+  // `topic: gf.topic` verbatim in the Fix B merge, not a normalized copy) —
+  // an exact-lowercase match here would silently miss it and pass either way.
+  check("a mixed-case gateway topic matching a REAL DELISTED_TOPICS entry does not appear at all",
+    !delistedDiscovery.feeds.some((f) => (f.topic || "").toLowerCase() === "crypto-top100"), delistedDiscovery.feeds);
+
+  console.log("\n── Site 1: mixed-case gateway topic already on-chain must NOT be duplicated ──");
+  mockPublishers = [
+    { address: ADDR_SERVED, status: 1, subscriberCount: 0n, messageCount: 0n,
+      schema: { frequencySeconds: 300, topicHex: topicToHex("test-served"), pricePerKB: 100000n, active: true } },
+  ];
+  mockIndexerPublishers = mockPublishers.map((p) => ({ address: p.address }));
+  mockGatewayFeeds = [{ topic: "Test-Served", priceAtomic: 100000, provenance: "first-party" }]; // same topic, mixed case, already on-chain
+  const dupDiscovery = await getFeeds();
+  // Same note as above: a spurious duplicate from Fix B would carry gf.topic's
+  // original mixed case ("Test-Served"), not the lowercase "test-served" the
+  // on-chain path derives via decodeTopic() — an exact-case filter here would
+  // count only the legitimate on-chain entry and miss the duplicate entirely.
+  const servedMatches = dupDiscovery.feeds.filter((f) => (f.topic || "").toLowerCase() === "test-served");
+  check("exactly ONE entry for the topic — not merged a second time via Fix B",
+    servedMatches.length === 1, dupDiscovery.feeds);
+  check("  and it IS purchasable (on-chain entry correctly matched the gateway feed)",
+    servedMatches[0] && servedMatches[0].purchasable === true, servedMatches);
+
   console.log(`\n${"=".repeat(60)}\n${PASS} passed, ${FAIL} failed`);
   global.fetch = realFetch;
   viemModule.createPublicClient = realCreatePublicClient;

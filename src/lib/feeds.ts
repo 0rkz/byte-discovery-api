@@ -112,6 +112,23 @@ function decodeTopic(hex: string): string {
   return str;
 }
 
+/**
+ * THE topic-comparison key, used on BOTH sides of every topic lookup in this
+ * file — every Set/Map built to be checked against a topic, and every needle
+ * checked against one. One named function instead of scattered inline
+ * `.toLowerCase()` calls (FD + team lead, 2026-08-04): this file had THREE
+ * separate normalized-haystack/un-normalized-needle mismatches accumulate
+ * across as many edits (x402Topics/gatewayByTopic construction; the Fix B
+ * merge's `present`/DELISTED_TOPICS check), each "safe" today only because
+ * fetchX402Feeds() happens to already lowercase upstream — an implicit
+ * cross-function contract, not a local guarantee. A single function everyone
+ * reaches for is the fix that survives the NEXT lookup someone adds, not just
+ * these three.
+ */
+function normalizeTopic(topic: string | null | undefined): string {
+  return (topic || "").toLowerCase();
+}
+
 /** Fetch JSON from the BYTE Library indexer, returning null on any failure. */
 async function fetchFromIndexer(path: string): Promise<any> {
   try {
@@ -148,7 +165,7 @@ async function fetchX402Feeds(): Promise<GatewayFeed[]> {
     const feeds = Array.isArray(data?.feeds) ? data.feeds : [];
     return feeds
       .map((f: any): GatewayFeed | null => {
-        const topic = (f.topic ?? f.id ?? "").toString().toLowerCase();
+        const topic = normalizeTopic((f.topic ?? f.id ?? "").toString());
         if (!topic) return null;
         return {
           topic,
@@ -192,7 +209,7 @@ export function buildEndpoints(
   const endpoints: Feed["endpoints"] = {
     onchain: contracts.DataStream,
   };
-  if (x402Topics.has(topic.toLowerCase())) {
+  if (x402Topics.has(normalizeTopic(topic))) {
     endpoints.mcp = "byte_buy_data";
     endpoints.x402 = `${config.x402Gateway}/feeds/${topic}`;
   }
@@ -309,10 +326,19 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
     fetchX402Feeds(),
   ]);
 
-  // Topics the gateway fronts (for the x402 endpoint decoration) + a lookup for
-  // gateway-advertised provenance.
-  const x402Topics = new Set(gatewayFeeds.map((f) => f.topic));
-  const gatewayByTopic = new Map(gatewayFeeds.map((f) => [f.topic, f]));
+  // Topics the gateway fronts (for the x402 endpoint decoration) + a lookup
+  // for gateway-advertised provenance. normalizeTopic()'d HERE, at
+  // construction — not just relied upon from fetchX402Feeds()'s own
+  // normalization (which does already normalize `topic`, so this never fires
+  // today; FD, 2026-08-04). Every lookup against both of these already
+  // normalizes its needle; building the haystack without the same
+  // normalization made that an IMPLICIT cross-function contract instead of a
+  // local guarantee — fails closed today (a mismatched entry just never
+  // matches, so a feed drops to no buy affordance rather than gaining a
+  // false one), but a local, redundant normalization removes the implicit
+  // dependency entirely rather than trusting it holds forever.
+  const x402Topics = new Set(gatewayFeeds.map((f) => normalizeTopic(f.topic)));
+  const gatewayByTopic = new Map(gatewayFeeds.map((f) => [normalizeTopic(f.topic), f]));
 
   let feeds: Feed[] = [];
   let totalMessages = 0;
@@ -334,14 +360,14 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
         subscribers: onChain.subscribers,
         messages: onChain.messages,
         provenance:
-          gatewayByTopic.get((onChain.topic || "").toLowerCase())?.provenance ??
+          gatewayByTopic.get(normalizeTopic(onChain.topic))?.provenance ??
           "on-chain",
         onchain: address,
         // Registered on-chain != fronted by the gateway (2026-08-04 fix) —
         // same check buildEndpoints uses to gate mcp/x402, computed here too
         // so `purchasable` is an explicit signal, not inferred from whether
         // `endpoints.mcp` happens to be present.
-        purchasable: x402Topics.has((onChain.topic || "").toLowerCase()),
+        purchasable: x402Topics.has(normalizeTopic(onChain.topic)),
         endpoints: buildEndpoints(onChain.topic, x402Topics),
       } satisfies Feed;
     });
@@ -380,12 +406,12 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
             subscribers: onChain.subscribers,
             messages: onChain.messages,
             provenance:
-              gatewayByTopic.get((onChain.topic || "").toLowerCase())
+              gatewayByTopic.get(normalizeTopic(onChain.topic))
                 ?.provenance ?? "on-chain",
             onchain: address as string,
             // Registered on-chain != fronted by the gateway — see the
             // indexer-driven path above for the full note.
-            purchasable: x402Topics.has((onChain.topic || "").toLowerCase()),
+            purchasable: x402Topics.has(normalizeTopic(onChain.topic)),
             endpoints: buildEndpoints(onChain.topic, x402Topics),
           });
         } catch {
@@ -400,18 +426,37 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
   // Drop delisted feeds whose on-chain publishers are still registered, so the
   // catalog reflects the LIVE product (not retired/superseded feeds). Recompute
   // the message total over the surviving feeds.
-  feeds = feeds.filter((f) => !DELISTED_TOPICS.has((f.topic || "").toLowerCase()));
+  feeds = feeds.filter((f) => !DELISTED_TOPICS.has(normalizeTopic(f.topic)));
 
-  // Fix B: surface first-party gateway-only oracles. These feeds (address-
-  // reputation, pkg-verdict, sanctions-screen, reasoning-verdict,
-  // liquidation-stream, positioning-snapshot) are live + billable via x402 but
-  // have NO on-chain DataRegistry publisher, so the indexer/chain enumeration
-  // above never includes them. Merge in any gateway feed not already present and
-  // not delisted — marked HONESTLY as first-party with onchain=null; we never
-  // fake an on-chain publisher address. Result: /discover == /feeds == 22.
-  const present = new Set(feeds.map((f) => (f.topic || "").toLowerCase()));
+  // Fix B: surface first-party gateway-only oracles — feeds that are live +
+  // billable via x402 but have NO on-chain DataRegistry publisher, so the
+  // indexer/chain enumeration above never includes them. Merge in any gateway
+  // feed not already present and not delisted — marked HONESTLY as
+  // first-party with onchain=null; we never fake an on-chain publisher
+  // address.
+  //
+  // As of 2026-08-04 this set is address-reputation, pkg-verdict,
+  // sanctions-screen, reasoning-verdict, merchant-screen, and
+  // positioning-snapshot — but treat that as a snapshot to VERIFY against the
+  // live /feeds catalog, not a fact to trust. An EARLIER version of this exact
+  // comment named liquidation-stream here (delisted 2026-07-28) and OMITTED
+  // merchant-screen (live the whole time) — the identical hardcoded-list-goes-
+  // stale defect this session has been closing everywhere else in this file
+  // (methods, x402Topics/gatewayByTopic normalization below), just caught in
+  // prose instead of code this time.
+  //
+  // Counts drift constantly and are NOT asserted equal: checked live
+  // 2026-08-04, /discover served 13 feeds while gateway /feeds served 10 —
+  // legitimately different, not a bug, because a feed can be registered
+  // on-chain without a gateway route yet (signature-screen,
+  // cctp-attestation-latency) or delisted from the gateway without a
+  // DELISTED_TOPICS entry yet (evidence-pack, until a human resolves it — see
+  // KNOWN_PENDING in ops/scripts/discover-gateway-consistency-check.cjs,
+  // which is the standing, automated way to check these two counts against
+  // each other; don't hand-recompute or restate a specific number here again).
+  const present = new Set(feeds.map((f) => normalizeTopic(f.topic)));
   for (const gf of gatewayFeeds) {
-    if (present.has(gf.topic) || DELISTED_TOPICS.has(gf.topic)) continue;
+    if (present.has(normalizeTopic(gf.topic)) || DELISTED_TOPICS.has(normalizeTopic(gf.topic))) continue;
     feeds.push({
       publisher: "first-party",
       topic: gf.topic,
@@ -431,7 +476,7 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
         x402: `${config.x402Gateway}/feeds/${gf.topic}`,
       },
     });
-    present.add(gf.topic);
+    present.add(normalizeTopic(gf.topic));
   }
 
   totalMessages = feeds.reduce((sum, f) => sum + f.messages, 0);
