@@ -331,6 +331,19 @@ const DELISTED_TOPICS = new Set([
   "agent-compute",
   "agent-memory",
   "agent-tools",
+  // ── founder-approved 2026-08-25 (AskUserQuestion, in-session) ──
+  // evidence-pack: per the 2026-07-28 delist (removed from the gateway
+  // feedRegistry for an integrity violation — served off-description output
+  // with an undisclosed third-party egress path; see x402-gateway
+  // config.ts's own delist comment). It was registered on-chain from before
+  // that date and had been sitting PENDING a formal DELISTED_TOPICS entry
+  // (ops/scripts/discover-gateway-consistency-check.cjs KNOWN_PENDING) —
+  // this closes that gap; discovery-api now stops advertising it too.
+  "evidence-pack",
+  // signature-screen: unfinished build — registered on-chain 2026-08-04
+  // (register_oracles.py FEEDS) but no gateway route was ever built.
+  // Delisted here until the build is completed, not a retirement of intent.
+  "signature-screen",
 ]);
 
 /**
