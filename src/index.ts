@@ -24,6 +24,20 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ─── defensive headers (security audit: api.payperbyte.io had no HSTS) ──
+// Same values the gateway emits via helmet: 1y HSTS incl. subdomains.
+// Served behind the Cloudflare tunnel, so the origin header reaches clients.
+app.use((_req, res, next) => {
+  res.setHeader(
+    "Strict-Transport-Security",
+    "max-age=31536000; includeSubDomains",
+  );
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  next();
+});
+
 // Health check
 app.get("/health", (_req, res) => {
   res.json({
