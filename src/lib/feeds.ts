@@ -388,7 +388,19 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
       return {
         publisher: address,
         topic: onChain.topic,
-        pricePerKB: onChain.pricePerKB,
+        // Price comes from the GATEWAY when the feed is gateway-fronted, and
+        // only falls back on-chain when it is not. The 402 challenge is the
+        // only price that is ENFORCED — an agent that budgets from a
+        // registry value the gateway will reject has been mispriced by us.
+        // Measured 2026-09-02: all five on-chain publishers carry the
+        // registration default pricePerKB=3000 on Arbitrum Sepolia (421614)
+        // while the gateway settles on Base (8453) at 5000/10000/20000/50000;
+        // only `earthquakes` agreed, and only because its gateway price
+        // happens to be 3000 too. Same resolution the `provenance` field
+        // below already uses — gatewayByTopic first, on-chain as fallback.
+        pricePerKB:
+          gatewayByTopic.get(normalizeTopic(onChain.topic))?.pricePerKB ??
+          onChain.pricePerKB,
         frequencySeconds: onChain.frequencySeconds,
         subscribers: onChain.subscribers,
         messages: onChain.messages,
@@ -434,7 +446,11 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
           feeds.push({
             publisher: address as string,
             topic: onChain.topic,
-            pricePerKB: onChain.pricePerKB,
+            // See the identical resolution in the indexer-driven path above:
+            // the gateway's enforced price wins whenever the feed is fronted.
+            pricePerKB:
+              gatewayByTopic.get(normalizeTopic(onChain.topic))?.pricePerKB ??
+              onChain.pricePerKB,
             frequencySeconds: onChain.frequencySeconds,
             subscribers: onChain.subscribers,
             messages: onChain.messages,
