@@ -1,6 +1,16 @@
 import dotenv from "dotenv";
 dotenv.config();
 
+/**
+ * The x402 gateway's PUBLIC base URL. This value is advertised to agents —
+ * it appears in every `endpoints.x402` (feeds.ts), in `access.x402_gateway`
+ * and in /.well-known/byte-protocol.json — so it MUST stay publicly
+ * resolvable. Never repoint it at loopback to shorten the server-side fetch:
+ * that publishes `http://127.0.0.1:3402/feeds/<topic>` to every agent.
+ * Use X402_GATEWAY_FETCH below for that.
+ */
+const X402_GATEWAY = process.env.X402_GATEWAY || "http://localhost:3402";
+
 /** Runtime configuration loaded from environment variables with sensible defaults. */
 export const config = {
   port: parseInt(process.env.PORT || "3500", 10),
@@ -11,7 +21,32 @@ export const config = {
   publicBaseUrl: process.env.PUBLIC_BASE_URL || "https://api.payperbyte.io",
   indexerUrl: process.env.INDEXER_URL || "https://feeds.payperbyte.io",
   marketplaceUrl: process.env.MARKETPLACE_URL || "https://www.payperbyte.io",
-  x402Gateway: process.env.X402_GATEWAY || "http://localhost:3402",
+  x402Gateway: X402_GATEWAY,
+
+  /**
+   * Base URL used ONLY for the server-side `GET /feeds` catalog fetch, never
+   * advertised. Defaults to the public base, so behaviour is unchanged until
+   * this is explicitly set. Point it at the gateway on loopback
+   * (`http://127.0.0.1:3402` — v4 literal, not `localhost`, because the
+   * gateway binds v4 only) to take that fetch off the public rate-limit
+   * bucket without changing a single URL agents see.
+   */
+  x402GatewayFetch: process.env.X402_GATEWAY_FETCH || X402_GATEWAY,
+
+  /**
+   * Deadline for the server's own outbound fetches (indexer + gateway).
+   * Without one, a hung upstream holds a /discover request open until the
+   * client gives up, and concurrent requests pile onto the same upstream.
+   */
+  gatewayFetchTimeoutMs: Number(process.env.GATEWAY_FETCH_TIMEOUT_MS ?? 5000),
+
+  /**
+   * How long an assembled catalog stays fresh. Every /discover previously did
+   * live RPC reads plus a gateway fetch per request, so a burst rate-limited
+   * itself; one shared catalog per window removes that. Also bounds how stale
+   * a `degraded` last-good response can be.
+   */
+  catalogTtlMs: Number(process.env.CATALOG_CACHE_TTL_MS ?? 10_000),
 
   chainId: 421614,
   chain: "arbitrum-sepolia",

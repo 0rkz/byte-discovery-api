@@ -208,3 +208,54 @@ Each feed is enriched with:
 ## License
 
 MIT
+
+## When the catalog cannot be built (fail-closed)
+
+`/discover` and the four routes that read the same catalog
+(`/discover/search`, `/discover/:topic`, `/publishers`, `/publisher/:address`)
+depend on the x402 gateway's `/feeds` catalog and on per-publisher on-chain
+reads. If any of those reads fails, the API does **not** answer with whatever
+it managed to collect.
+
+Why: a catalog assembled from a partial set of reads looks exactly like a real
+one. On 2026-09-03 a rate-limited gateway made `/discover` advertise
+`threat-intel` at 3000 µUSDC while the gateway enforced 50000, drop 7 of 12
+feeds, and null every `pricePerCall` — all at HTTP 200, so nothing downstream
+could tell. An agent that budgets from those numbers gets a 402 it cannot pay.
+
+What happens instead:
+
+| Situation | Response |
+|---|---|
+| Every read succeeded | 200, normal body. `degraded`, `degradedReason` and `lastGoodAt` are **absent** |
+| A read failed, a previous good catalog exists | 200, the **last good** catalog plus the three fields below |
+| A read failed, no good catalog yet (e.g. just restarted) | **503** with `Retry-After: 10` and `{ "error": "gateway catalog unavailable", "degraded": true, "degradedReason": "…" }` |
+
+Fields present only on a degraded response:
+
+- `degraded` — always `true` when present. Absent, never `false`, on a healthy response.
+- `degradedReason` — short cause, e.g. `gateway /feeds 429` or `schema read failed for 0x…`.
+- `lastGoodAt` — ISO timestamp of the last fully successful assembly.
+
+A degraded body carries real prices that were correct at `lastGoodAt` — not
+placeholders and not guesses. Treat the enforced 402 price as authoritative,
+and do not read a feed's absence as a delisting while `degraded` is set.
+
+### Environment
+
+| Variable | Default | What it does |
+|---|---|---|
+| `X402_GATEWAY` | `http://localhost:3402` | The gateway base **advertised to agents**. Must stay publicly resolvable. |
+| `X402_GATEWAY_FETCH` | same as `X402_GATEWAY` | Base used **only** for the server's own `/feeds` fetch. Point it at loopback to keep that fetch off the public rate limit; nothing agents see changes. |
+| `GATEWAY_FETCH_TIMEOUT_MS` | `5000` | Deadline for the server's outbound fetches. |
+| `CATALOG_CACHE_TTL_MS` | `10000` | How long one assembled catalog is reused. Concurrent requests share a single assembly. |
+
+### Checking it
+
+```sh
+scripts/probe-discover-concurrent.sh http://127.0.0.1:3500 60 10
+```
+
+Sends 60 requests at concurrency 10 and exits non-zero if any 200 carries a
+non-modal or degraded catalog. A sequential check does not catch this class:
+the broken build passed one ~90% of the time.

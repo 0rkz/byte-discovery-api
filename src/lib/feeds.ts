@@ -21,6 +21,28 @@ const client = createPublicClient({
   transport: http(config.rpcUrl),
 });
 
+/**
+ * Thrown when a catalog could not be assembled from every upstream it needs
+ * AND there is no last-good catalog to fall back on. The routes turn this
+ * into 503 + Retry-After.
+ *
+ * The rule this enforces (byte/CLAUDE.md §1, fail-closed): we would rather
+ * answer "I cannot tell you right now" than answer with a catalog we could
+ * not price. A partially-assembled catalog is not a smaller truth — it is a
+ * wrong answer that looks exactly like a right one, because a feed missing
+ * from /discover and a feed that does not exist are indistinguishable to the
+ * agent reading it.
+ */
+export class CatalogUnavailableError extends Error {
+  /** Short machine-ish cause, e.g. "gateway /feeds 429". Safe to show a client. */
+  readonly reason: string;
+  constructor(reason: string) {
+    super(`catalog unavailable: ${reason}`);
+    this.name = "CatalogUnavailableError";
+    this.reason = reason;
+  }
+}
+
 /** A single data feed with publisher metadata and access endpoints. */
 export interface Feed {
   publisher: string;
@@ -97,26 +119,49 @@ export interface DiscoveryResponse {
     mcp_server: string;
     indexer_api: string;
   };
+  /**
+   * ABSENT on a healthy response — not `false`. Present and `true` only when
+   * at least one upstream read failed and this body is therefore the LAST
+   * GOOD catalog, not a fresh one. Prices and feeds are real values that were
+   * correct at `lastGoodAt`; they are not placeholders and not guesses.
+   *
+   * What to do with it: an agent may still read prices from a degraded body,
+   * but should expect the enforced 402 price to be authoritative and should
+   * not treat a feed's absence as a delisting. Check `lastGoodAt` for age.
+   */
+  degraded?: true;
+  /** Why the refresh failed, e.g. "gateway /feeds 429" or
+   *  "schema read failed for 0xa820…". Only present alongside `degraded`. */
+  degradedReason?: string;
+  /** ISO timestamp of the last fully-successful assembly. Only present
+   *  alongside `degraded`. */
+  lastGoodAt?: string;
 }
 
 /**
- * Decode a bytes32 hex value to a printable topic string. Schemas store
- * topics as ASCII padded with null bytes. If the bytes don't decode to
- * printable ASCII (e.g., the value is a hash or random bytes), fall back
- * to "data-feed".
+ * Decode a bytes32 hex value to a printable topic string, or null when the
+ * bytes hold no usable topic (absent, a hash, random bytes, wrong length).
+ *
+ * Returns NULL rather than the old "data-feed" sentinel. That sentinel was
+ * one of the two producers of the placeholder feeds measured on 2026-09-03:
+ * a publisher with no readable topic was emitted as a feed literally named
+ * `data-feed` priced 0, and several such publishers at once collided into
+ * duplicate entries under that one name. A caller must now decide explicitly
+ * what to do with "no topic" — here, skip the publisher — instead of being
+ * handed a plausible-looking string it cannot distinguish from a real topic.
  */
-function decodeTopic(hex: string): string {
-  if (!hex || typeof hex !== "string") return "data-feed";
+function decodeTopicOrNull(hex: string): string | null {
+  if (!hex || typeof hex !== "string") return null;
   const bytes = hex.replace(/^0x/, "");
   let str = "";
   for (let i = 0; i < bytes.length; i += 2) {
     const code = parseInt(bytes.substr(i, 2), 16);
-    if (Number.isNaN(code)) return "data-feed";
+    if (Number.isNaN(code)) return null;
     if (code === 0) break;
     str += String.fromCharCode(code);
   }
-  if (str.length < 2 || str.length > 31) return "data-feed";
-  if (!/^[a-zA-Z0-9._\-: ]+$/.test(str)) return "data-feed";
+  if (str.length < 2 || str.length > 31) return null;
+  if (!/^[a-zA-Z0-9._\-: ]+$/.test(str)) return null;
   return str;
 }
 
@@ -157,13 +202,30 @@ function normalizeTopic(topic: string | null | undefined): string {
   return String(topic ?? "").toLowerCase();
 }
 
-/** Fetch JSON from the BYTE Library indexer, returning null on any failure. */
+/**
+ * Fetch JSON from the BYTE Library indexer, returning null on any failure.
+ *
+ * Null here is NOT a catalog failure: the indexer is a fast path, and
+ * getFeeds() falls back to enumerating publishers on-chain, which produces a
+ * complete catalog on its own. That fallback is the reason this one stays
+ * "return null" while the gateway fetch below does not.
+ */
 async function fetchFromIndexer(path: string): Promise<any> {
   try {
-    const res = await fetch(`${config.indexerUrl}${path}`);
-    if (!res.ok) return null;
+    const res = await fetch(`${config.indexerUrl}${path}`, {
+      signal: AbortSignal.timeout(config.gatewayFetchTimeoutMs),
+    });
+    if (!res.ok) {
+      console.error(
+        `[discover] indexer ${path} FAILED (${res.status}) — falling back to on-chain enumeration`,
+      );
+      return null;
+    }
     return await res.json();
-  } catch {
+  } catch (err) {
+    console.error(
+      `[discover] indexer ${path} FAILED (${(err as Error)?.name || "error"}) — falling back to on-chain enumeration`,
+    );
     return null;
   }
 }
@@ -190,30 +252,62 @@ interface GatewayFeed {
  *     sanctions-screen, reasoning-verdict, liquidation-stream, positioning-snapshot)
  *     that have NO on-chain DataRegistry publisher, so the indexer/chain
  *     enumeration never sees them.
- * Returns [] on any failure (→ no x402 decoration, no gateway merge; graceful).
+ * FAILURE IS NOT AN EMPTY CATALOG. This used to return [] on any failure, and
+ * the caller could not tell "the gateway fronts nothing" from "I could not
+ * reach the gateway". Those produce very different responses: the first is a
+ * true empty catalog, the second silently drops every gateway-only feed,
+ * nulls every pricePerCall, and re-prices the survivors from their on-chain
+ * registration default — which is how threat-intel came to be advertised at
+ * 3000 when the gateway enforces 50000. Measured 2026-09-03: 6 of 60 public
+ * /discover reads, 41 of 60 at concurrency 10.
+ *
+ * GOOD = HTTP 2xx AND `feeds` is an array. An empty array from a 2xx IS good.
+ * Everything else — non-2xx, parse error, timeout, thrown fetch — is a
+ * failure carrying a short reason the caller reports rather than hides.
+ *
+ * Reads `config.x402GatewayFetch`, which is the ONLY place that variable is
+ * used. Every URL this file advertises to agents keeps `config.x402Gateway`.
  */
-async function fetchX402Feeds(): Promise<GatewayFeed[]> {
+type GatewayResult =
+  | { ok: true; feeds: GatewayFeed[] }
+  | { ok: false; reason: string };
+
+async function fetchX402Feeds(): Promise<GatewayResult> {
+  let data: any;
   try {
-    const res = await fetch(`${config.x402Gateway}/feeds`);
-    if (!res.ok) return [];
-    const data = await res.json();
-    const feeds = Array.isArray(data?.feeds) ? data.feeds : [];
-    return feeds
-      .map((f: any): GatewayFeed | null => {
-        const topic = normalizeTopic((f.topic ?? f.id ?? "").toString());
-        if (!topic) return null;
-        const priceAtomic = Number(f.priceAtomic ?? f.pricePerKB ?? 0) || 0;
-        return {
-          topic,
-          pricePerKB: priceAtomic,
-          pricePerCall: priceAtomic,
-          provenance: (f.provenance ?? "").toString() || "first-party",
-        };
-      })
-      .filter((f: GatewayFeed | null): f is GatewayFeed => f !== null);
-  } catch {
-    return [];
+    const res = await fetch(`${config.x402GatewayFetch}/feeds`, {
+      signal: AbortSignal.timeout(config.gatewayFetchTimeoutMs),
+    });
+    if (!res.ok) return { ok: false, reason: `gateway /feeds ${res.status}` };
+    data = await res.json();
+  } catch (err) {
+    // AbortSignal.timeout() rejects with a TimeoutError; say "timeout" plainly.
+    const name = (err as Error)?.name || "error";
+    return {
+      ok: false,
+      reason: `gateway /feeds ${name === "TimeoutError" ? "timeout" : name}`,
+    };
   }
+
+  if (!Array.isArray(data?.feeds)) {
+    return { ok: false, reason: "gateway /feeds malformed body (no feeds array)" };
+  }
+
+  const parsed: GatewayFeed[] = data.feeds
+    .map((f: any): GatewayFeed | null => {
+      const topic = normalizeTopic((f.topic ?? f.id ?? "").toString());
+      if (!topic) return null;
+      const priceAtomic = Number(f.priceAtomic ?? f.pricePerKB ?? 0) || 0;
+      return {
+        topic,
+        pricePerKB: priceAtomic,
+        pricePerCall: priceAtomic,
+        provenance: (f.provenance ?? "").toString() || "first-party",
+      };
+    })
+    .filter((f: GatewayFeed | null): f is GatewayFeed => f !== null);
+
+  return { ok: true, feeds: parsed };
 }
 
 /**
@@ -253,12 +347,8 @@ export function buildEndpoints(
   return endpoints;
 }
 
-/**
- * Read a publisher's state by joining DataRegistry and SchemaRegistry in
- * parallel. Returns null if the publisher's core record can't be read;
- * a missing schema gets safe defaults.
- */
-async function getOnChainPublisherData(publisher: `0x${string}`): Promise<{
+/** What a publisher's on-chain state resolved to. */
+interface OnChainPublisher {
   status: number;
   topic: string;
   pricePerKB: number;
@@ -266,7 +356,39 @@ async function getOnChainPublisherData(publisher: `0x${string}`): Promise<{
   active: boolean;
   subscribers: number;
   messages: number;
-} | null> {
+}
+
+/**
+ * The outcome of reading one publisher. THREE outcomes, not two — this is the
+ * distinction the old `| null` return could not carry, and the reason a failed
+ * RPC read looked identical to a publisher that simply is not in the catalog:
+ *
+ *  ok        — read succeeded, publisher belongs in the catalog
+ *  skipped   — read succeeded and the publisher legitimately is NOT a feed
+ *              (unregistered, banned, or no usable topic). NOT a failure.
+ *  failed    — we could not read it. The catalog is INCOMPLETE and must not
+ *              be served as if it were whole.
+ */
+type PublisherRead =
+  | { kind: "ok"; data: OnChainPublisher }
+  | { kind: "skipped" }
+  | { kind: "failed"; reason: string };
+
+/**
+ * Read a publisher's state by joining DataRegistry and SchemaRegistry in
+ * parallel.
+ *
+ * A failed SchemaRegistry read used to fall through to `topic: "data-feed",
+ * pricePerKB: 0` — a feed that does not exist, at a price that is not real.
+ * Under RPC contention several publishers degraded at once and collided into
+ * duplicate `data-feed` entries; one measured response carried 13 feeds for a
+ * 12-feed catalog because `weather` was emitted as a placeholder AND re-added
+ * by the gateway merge. A read we could not do is now reported, never
+ * substituted for.
+ */
+async function getOnChainPublisherData(
+  publisher: `0x${string}`,
+): Promise<PublisherRead> {
   try {
     const [pubResult, schemaResult] = await Promise.allSettled([
       client.readContract({
@@ -283,37 +405,66 @@ async function getOnChainPublisherData(publisher: `0x${string}`): Promise<{
       }),
     ]);
 
-    if (pubResult.status !== "fulfilled" || !pubResult.value) return null;
+    if (pubResult.status !== "fulfilled" || !pubResult.value) {
+      return {
+        kind: "failed",
+        reason: `publisher read failed for ${publisher}`,
+      };
+    }
     const pub = pubResult.value as {
       status: number;
       subscriberCount: bigint;
       messageCount: bigint;
     };
 
-    // Skip unregistered or banned publishers.
-    if (Number(pub.status) === 0 || Number(pub.status) === 4) return null;
+    // Skip unregistered or banned publishers. A deliberate exclusion, not a
+    // failure — the catalog is still complete without them.
+    if (Number(pub.status) === 0 || Number(pub.status) === 4) {
+      return { kind: "skipped" };
+    }
 
-    const schema =
-      schemaResult.status === "fulfilled" && schemaResult.value
-        ? (schemaResult.value as {
-            frequencySeconds: number;
-            topic: string;
-            pricePerKB: bigint;
-            active: boolean;
-          })
-        : null;
+    // A REJECTED schema read is not "no schema" — it is "we do not know".
+    // Report it; the assembly is incomplete.
+    if (schemaResult.status !== "fulfilled") {
+      return {
+        kind: "failed",
+        reason: `schema read failed for ${publisher}`,
+      };
+    }
+
+    const schema = schemaResult.value as
+      | {
+          frequencySeconds: number;
+          topic: string;
+          pricePerKB: bigint;
+          active: boolean;
+        }
+      | null
+      | undefined;
+
+    // Read succeeded and there is no schema, or its topic bytes hold nothing
+    // usable: this publisher has no feed to advertise. Skipping is honest;
+    // emitting it under a made-up name at price 0 was not.
+    const topic = schema ? decodeTopicOrNull(schema.topic) : null;
+    if (!schema || !topic) return { kind: "skipped" };
 
     return {
-      status: Number(pub.status),
-      topic: schema ? decodeTopic(schema.topic) : "data-feed",
-      pricePerKB: schema ? Number(schema.pricePerKB) : 0,
-      frequencySeconds: schema ? Number(schema.frequencySeconds) : 0,
-      active: schema ? schema.active : false,
-      subscribers: Number(pub.subscriberCount),
-      messages: Number(pub.messageCount),
+      kind: "ok",
+      data: {
+        status: Number(pub.status),
+        topic,
+        pricePerKB: Number(schema.pricePerKB),
+        frequencySeconds: Number(schema.frequencySeconds),
+        active: schema.active,
+        subscribers: Number(pub.subscriberCount),
+        messages: Number(pub.messageCount),
+      },
     };
-  } catch {
-    return null;
+  } catch (err) {
+    return {
+      kind: "failed",
+      reason: `publisher read threw for ${publisher} (${(err as Error)?.name || "error"})`,
+    };
   }
 }
 
@@ -367,14 +518,37 @@ const DELISTED_TOPICS = new Set([
  * Build the full discovery response: enumerate publishers and enrich each
  * with on-chain data.
  */
-export async function getFeeds(): Promise<DiscoveryResponse> {
+/**
+ * One assembly attempt. Returns the catalog it built AND whether every
+ * upstream read it needed actually succeeded.
+ *
+ * `incomplete` is ONE marker collected across all three former fail-open
+ * sites and checked once by the caller — not three separate mechanisms. If it
+ * is non-null the response must not be served as fresh, whatever it contains.
+ */
+async function assembleCatalog(): Promise<{
+  response: DiscoveryResponse;
+  incomplete: string | null;
+}> {
   // Fix A: request the full publisher page. The indexer's default page size is
   // 20 but it holds 24 publishers, so the unpaginated call truncated the list
   // (dropping `earthquakes`, a live feed) and caused the 15↔16 discover flap.
-  const [indexerData, gatewayFeeds] = await Promise.all([
+  const [indexerData, gatewayResult] = await Promise.all([
     fetchFromIndexer("/publishers?limit=200"),
     fetchX402Feeds(),
   ]);
+
+  // Without the gateway catalog nothing below can be priced or marked
+  // purchasable, so there is no partial answer worth assembling. Bail before
+  // doing on-chain reads we would only have to throw away.
+  if (!gatewayResult.ok) {
+    return { response: emptyResponse(), incomplete: gatewayResult.reason };
+  }
+  const gatewayFeeds = gatewayResult.feeds;
+
+  // Every upstream read that failed during this assembly. Non-empty ⇒ the
+  // catalog is incomplete, no matter how many feeds it happens to hold.
+  const failures: string[] = [];
 
   // Topics the gateway fronts (for the x402 endpoint decoration) + a lookup
   // for gateway-advertised provenance. normalizeTopic()'d HERE, at
@@ -397,8 +571,13 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
     // Indexer-driven: fast path, enriched with fresh on-chain reads.
     const feedPromises = indexerData.map(async (pub: any) => {
       const address = pub.address || pub.publisher;
-      const onChain = await getOnChainPublisherData(address as `0x${string}`);
-      if (!onChain) return null;
+      const read = await getOnChainPublisherData(address as `0x${string}`);
+      if (read.kind === "failed") {
+        failures.push(read.reason);
+        return null;
+      }
+      if (read.kind === "skipped") return null;
+      const onChain = read.data;
 
       totalMessages += onChain.messages;
 
@@ -461,8 +640,13 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
             args: [BigInt(i)],
           });
 
-          const onChain = await getOnChainPublisherData(address as `0x${string}`);
-          if (!onChain) continue;
+          const read = await getOnChainPublisherData(address as `0x${string}`);
+          if (read.kind === "failed") {
+            failures.push(read.reason);
+            continue;
+          }
+          if (read.kind === "skipped") continue;
+          const onChain = read.data;
 
           totalMessages += onChain.messages;
 
@@ -492,12 +676,21 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
             purchasable: x402Topics.has(normalizeTopic(onChain.topic)),
             endpoints: buildEndpoints(onChain.topic, x402Topics),
           });
-        } catch {
-          // Skip individual publisher read failures and continue.
+        } catch (err) {
+          // A per-publisher read that throws is a MISSING FEED, not a feed
+          // that does not exist. Record it; the assembly is incomplete.
+          failures.push(
+            `publisher enumeration failed at index ${i} (${(err as Error)?.name || "error"})`,
+          );
         }
       }
-    } catch {
-      // No on-chain data available — return empty feed list.
+    } catch (err) {
+      // This used to return an empty feed list at HTTP 200 — measured 19 times
+      // in 60 concurrent requests. An empty catalog is a claim that the
+      // product has no feeds; we do not get to make it because a read failed.
+      failures.push(
+        `chain enumeration failed (${(err as Error)?.name || "error"})`,
+      );
     }
   }
 
@@ -581,20 +774,155 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
   totalMessages = feeds.reduce((sum, f) => sum + f.messages, 0);
 
   return {
+    response: {
+      protocol: "byte",
+      version: "1.0",
+      chain: config.chain,
+      chainId: config.chainId,
+      payment: config.payment,
+      attestation: config.attestation,
+      totalFeeds: feeds.length,
+      distinctOperators: 1, // all first-party PayPerByte — not independent orgs
+      totalMessages,
+      feeds,
+      access: {
+        // The PUBLIC base, never config.x402GatewayFetch — this string is
+        // advertised to agents.
+        x402_gateway: config.x402Gateway,
+        mcp_server: "https://mcp.payperbyte.io/mcp",
+        indexer_api: config.indexerUrl,
+      },
+    },
+    incomplete: failures.length ? failures.join("; ") : null,
+  };
+}
+
+/** The shape returned when an assembly bailed before it could build anything. */
+function emptyResponse(): DiscoveryResponse {
+  return {
     protocol: "byte",
     version: "1.0",
     chain: config.chain,
     chainId: config.chainId,
     payment: config.payment,
     attestation: config.attestation,
-    totalFeeds: feeds.length,
-    distinctOperators: 1, // all first-party PayPerByte — not independent orgs
-    totalMessages,
-    feeds,
+    totalFeeds: 0,
+    distinctOperators: 1,
+    totalMessages: 0,
+    feeds: [],
     access: {
       x402_gateway: config.x402Gateway,
       mcp_server: "https://mcp.payperbyte.io/mcp",
       indexer_api: config.indexerUrl,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Catalog cache, single-flight, and the last-good fallback.
+//
+// Process memory only — a restart starts cold, which is correct: a cold
+// process has nothing it can honestly call "last good".
+// ---------------------------------------------------------------------------
+
+/** The last catalog every upstream agreed on. Also the cache. */
+let lastGood: DiscoveryResponse | null = null;
+/** ISO stamp of when `lastGood` was assembled. */
+let lastGoodAt: string | null = null;
+/** Epoch ms of the same, for age arithmetic. */
+let lastGoodMs = 0;
+/** Epoch ms of the last returned result — TTL is measured from here. */
+let servedAt = 0;
+/** What we last returned (good or degraded), served while inside the TTL. */
+let lastResult: DiscoveryResponse | null = null;
+/** The in-flight assembly, shared by every concurrent caller. */
+let inFlight: Promise<DiscoveryResponse> | null = null;
+
+/** Test seam: drop all cached state. Not used in production paths. */
+export function __resetCatalogCacheForTests(): void {
+  lastGood = null;
+  lastGoodAt = null;
+  lastGoodMs = 0;
+  servedAt = 0;
+  lastResult = null;
+  inFlight = null;
+}
+
+/** Human-readable age, e.g. "41s". */
+function ageSeconds(sinceMs: number): string {
+  return `${Math.max(0, Math.round((Date.now() - sinceMs) / 1000))}s`;
+}
+
+/**
+ * Assemble a catalog, or serve the last good one, or fail closed.
+ *
+ * Never returns a catalog built from a partial set of upstream reads. The
+ * three outcomes are:
+ *   1. every read succeeded          → fresh catalog, cached, becomes last-good
+ *   2. a read failed, last-good held → last-good + `degraded` disclosure
+ *   3. a read failed, nothing held   → CatalogUnavailableError (→ 503)
+ */
+async function refreshCatalog(): Promise<DiscoveryResponse> {
+  const { response, incomplete } = await assembleCatalog();
+
+  if (!incomplete) {
+    // A real but suspiciously small catalog is still served — it may be a
+    // genuine delisting — but it never passes unremarked.
+    if (lastGood && response.totalFeeds * 2 < lastGood.totalFeeds) {
+      console.error(
+        `[discover] gateway catalog shrank ${lastGood.totalFeeds} -> ${response.totalFeeds}`,
+      );
+    }
+    lastGood = response;
+    lastGoodMs = Date.now();
+    lastGoodAt = new Date(lastGoodMs).toISOString();
+    return response;
+  }
+
+  if (lastGood) {
+    console.error(
+      `[discover] upstream FAILED (${incomplete}) — serving last-good catalog from ${lastGoodAt} (age ${ageSeconds(lastGoodMs)})`,
+    );
+    // A COPY: the cached last-good must never carry the degraded keys itself,
+    // or the next healthy hit would inherit them.
+    return {
+      ...lastGood,
+      degraded: true,
+      degradedReason: incomplete,
+      lastGoodAt: lastGoodAt as string,
+    };
+  }
+
+  console.error(
+    `[discover] upstream FAILED (${incomplete}) — no last-good catalog, answering 503`,
+  );
+  throw new CatalogUnavailableError(incomplete);
+}
+
+/**
+ * Build the full discovery response: enumerate publishers and enrich each
+ * with on-chain data.
+ *
+ * Concurrent callers inside the TTL share one assembly. Before this, every
+ * request did its own live RPC reads plus a gateway fetch, so a burst
+ * rate-limited itself against the gateway and then fell open on the 429 —
+ * which is how 41 of 60 concurrent requests returned a wrong catalog.
+ */
+export async function getFeeds(): Promise<DiscoveryResponse> {
+  if (lastResult && Date.now() - servedAt < config.catalogTtlMs) {
+    return lastResult;
+  }
+  if (inFlight) return inFlight;
+
+  inFlight = refreshCatalog()
+    .then((res) => {
+      lastResult = res;
+      servedAt = Date.now();
+      return res;
+    })
+    .finally(() => {
+      inFlight = null;
+    });
+
+  return inFlight;
 }

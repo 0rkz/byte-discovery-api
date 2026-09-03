@@ -14,6 +14,7 @@ import path from "path";
 import { keccak256, toBytes } from "viem";
 import { config, contracts } from "./lib/config";
 import { getFeeds } from "./lib/feeds";
+import { sendCatalogError } from "./lib/http-errors";
 
 // Payload archive served by feed bots' broadcast_helper.py. Key is the
 // SHA-256 hash committed on-chain → files named {hash}.json (no 0x prefix).
@@ -124,8 +125,7 @@ app.get("/discover", async (_req, res) => {
     const discovery = await getFeeds();
     res.json(discovery);
   } catch (err) {
-    console.error("Error fetching feeds:", err);
-    res.status(500).json({ error: "Failed to fetch feed data" });
+    sendCatalogError(res, err, "Error fetching feeds:", "Failed to fetch feed data");
   }
 });
 
@@ -158,8 +158,7 @@ app.get("/discover/search", async (req, res) => {
       feeds: filtered,
     });
   } catch (err) {
-    console.error("Error searching feeds:", err);
-    res.status(500).json({ error: "Failed to search feeds" });
+    sendCatalogError(res, err, "Error searching feeds:", "Failed to search feeds");
   }
 });
 
@@ -180,8 +179,7 @@ app.get("/discover/:topic", async (req, res) => {
 
     res.json(feed);
   } catch (err) {
-    console.error("Error fetching feed:", err);
-    res.status(500).json({ error: "Failed to fetch feed data" });
+    sendCatalogError(res, err, "Error fetching feed:", "Failed to fetch feed data");
   }
 });
 
@@ -197,8 +195,7 @@ app.get("/publishers", async (_req, res) => {
       publishers: discovery.feeds,
     });
   } catch (err) {
-    console.error("Error fetching publishers:", err);
-    res.status(500).json({ error: "Failed to fetch publisher data" });
+    sendCatalogError(res, err, "Error fetching publishers:", "Failed to fetch publisher data");
   }
 });
 
@@ -219,8 +216,7 @@ app.get("/publisher/:address", async (req, res) => {
 
     res.json(publisher);
   } catch (err) {
-    console.error("Error fetching publisher:", err);
-    res.status(500).json({ error: "Failed to fetch publisher data" });
+    sendCatalogError(res, err, "Error fetching publisher:", "Failed to fetch publisher data");
   }
 });
 

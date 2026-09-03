@@ -123,7 +123,22 @@ global.fetch = async (url) => {
 
 // NOW require the COMPILED feeds.js — its own require("viem") resolves to
 // the SAME (already-mutated) cached module object.
-const { getFeeds, buildEndpoints } = require("./dist/lib/feeds.js");
+const {
+  getFeeds,
+  buildEndpoints,
+  __resetCatalogCacheForTests,
+} = require("./dist/lib/feeds.js");
+
+// getFeeds() caches a good catalog for CATALOG_CACHE_TTL_MS and shares one
+// in-flight assembly between concurrent callers. Every scenario below swaps
+// the mocks and then calls getFeeds() again, so each one must start from a
+// cold cache or it would silently re-assert the PREVIOUS scenario's catalog.
+// (That is exactly what happened when the cache landed: the last block failed
+// while five earlier ones passed on stale data that happened to still match.)
+async function freshGetFeeds() {
+  __resetCatalogCacheForTests();
+  return getFeeds();
+}
 
 async function main() {
   // ───────────────────────────────────────────────────────────────────────
@@ -176,7 +191,7 @@ async function main() {
     // the bug shape (removed from / never fronted by the gateway).
   ];
 
-  const discovery = await getFeeds();
+  const discovery = await freshGetFeeds();
   const byTopic = new Map(discovery.feeds.map((f) => [f.topic, f]));
 
   const servedFeed = byTopic.get("test-served");
@@ -194,11 +209,14 @@ async function main() {
   check("  endpoints.x402 is ABSENT", notServedFeed && !("x402" in notServedFeed.endpoints), notServedFeed);
   check("  endpoints.onchain is STILL present", notServedFeed && typeof notServedFeed.endpoints.onchain === "string" && notServedFeed.endpoints.onchain.length > 0, notServedFeed);
 
-  const evidencePackFeed = byTopic.get("evidence-pack");
-  check("EVIDENCE-PACK SHAPE: still present (not in DELISTED_TOPICS)", !!evidencePackFeed);
-  check("  purchasable: false (this is the 2026-07-28 bug this fix closes)", evidencePackFeed && evidencePackFeed.purchasable === false, evidencePackFeed);
-  check("  endpoints.mcp is ABSENT — no more false buy verb", evidencePackFeed && !("mcp" in evidencePackFeed.endpoints), evidencePackFeed);
-  check("  endpoints.x402 is ABSENT (was ALREADY correctly absent before this fix)", evidencePackFeed && !("x402" in evidencePackFeed.endpoints), evidencePackFeed);
+  // evidence-pack was DELISTED (feeds.ts DELISTED_TOPICS) after this block was
+  // written, so it must now be absent entirely — the block kept asserting the
+  // pre-delisting shape and had been failing ever since. The "registered
+  // on-chain but not fronted by the gateway, therefore still present and not
+  // purchasable" case it used to cover is already covered above by
+  // test-not-served; this now asserts the delisting instead.
+  check("EVIDENCE-PACK is COMPLETELY ABSENT (in DELISTED_TOPICS)",
+    !byTopic.has("evidence-pack"));
 
   check("DELISTED topic (crypto-top100) is COMPLETELY ABSENT — delisting filter unaffected by this fix",
     !byTopic.has("crypto-top100"));
@@ -243,7 +261,7 @@ async function main() {
   mockPublisherListOrder = [ADDR_SERVED, ADDR_NOT_SERVED];
   mockPublishers = mockPublishers.slice(0, 2); // just the served + not-served pair
 
-  const fallbackDiscovery = await getFeeds();
+  const fallbackDiscovery = await freshGetFeeds();
   const fallbackByTopic = new Map(fallbackDiscovery.feeds.map((f) => [f.topic, f]));
   const fbServed = fallbackByTopic.get("test-served");
   const fbNotServed = fallbackByTopic.get("test-not-served");
@@ -280,7 +298,7 @@ async function main() {
   mockGatewayFeeds = [
     { topic: "Test-Served", priceAtomic: 100000, provenance: "first-party" }, // MIXED CASE in the raw response
   ];
-  const mixedCaseDiscovery = await getFeeds();
+  const mixedCaseDiscovery = await freshGetFeeds();
   const mixedCaseServed = mixedCaseDiscovery.feeds.find((f) => f.topic === "test-served");
   check("mixed-case gateway topic -> the (lowercase) discover topic is still purchasable",
     mixedCaseServed && mixedCaseServed.purchasable === true, mixedCaseServed);
@@ -306,7 +324,7 @@ async function main() {
   mockPublishers = [];
   mockIndexerPublishers = [];
   mockGatewayFeeds = [{ topic: "Crypto-Top100", priceAtomic: 100, provenance: "first-party" }]; // real DELISTED_TOPICS entry, mixed case
-  const delistedDiscovery = await getFeeds();
+  const delistedDiscovery = await freshGetFeeds();
   // NOTE: a leaked entry keeps gf.topic's ORIGINAL casing (feeds.ts pushes
   // `topic: gf.topic` verbatim in the Fix B merge, not a normalized copy) —
   // an exact-lowercase match here would silently miss it and pass either way.
@@ -320,7 +338,7 @@ async function main() {
   ];
   mockIndexerPublishers = mockPublishers.map((p) => ({ address: p.address }));
   mockGatewayFeeds = [{ topic: "Test-Served", priceAtomic: 100000, provenance: "first-party" }]; // same topic, mixed case, already on-chain
-  const dupDiscovery = await getFeeds();
+  const dupDiscovery = await freshGetFeeds();
   // Same note as above: a spurious duplicate from Fix B would carry gf.topic's
   // original mixed case ("Test-Served"), not the lowercase "test-served" the
   // on-chain path derives via decodeTopic() — an exact-case filter here would
@@ -364,7 +382,7 @@ async function main() {
   mockPublishers = [];
   mockIndexerPublishers = [];
   mockGatewayFeeds = [{ topic: "Brand-New-Oracle", priceAtomic: 50000, provenance: "first-party" }]; // gateway-only, no on-chain match
-  const newOracleDiscovery = await getFeeds();
+  const newOracleDiscovery = await freshGetFeeds();
   const newOracleEntry = newOracleDiscovery.feeds.find((f) => (f.topic || "").toLowerCase() === "brand-new-oracle");
   check("emitted topic field is exactly lowercase, never the mixed-case original",
     newOracleEntry && newOracleEntry.topic === "brand-new-oracle", newOracleEntry);
