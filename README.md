@@ -95,6 +95,7 @@ List all active data feeds with publisher metadata, pricing, and provenance labe
       "publisher": "0xa820763c023a929e83c59e4fd5a623e5a8efe941",
       "topic": "weather",
       "pricePerKB": 3000,
+      "pricePerCall": 3000,
       "frequencySeconds": 3600,
       "subscribers": 2,
       "messages": 680,

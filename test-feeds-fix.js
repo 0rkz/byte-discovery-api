@@ -210,6 +210,23 @@ async function main() {
   check("  endpoints.mcp present", gatewayOnlyFeed && gatewayOnlyFeed.endpoints.mcp === "byte_buy_data", gatewayOnlyFeed);
   check("  endpoints.x402 present", gatewayOnlyFeed && typeof gatewayOnlyFeed.endpoints.x402 === "string", gatewayOnlyFeed);
 
+  // ───────────────────────────────────────────────────────────────────────
+  // Section 2b (Wave 2 — pricePerCall): gateway-fronted feeds carry
+  // pricePerCall === pricePerKB (both derived from the same gateway
+  // priceAtomic); non-fronted feeds carry pricePerCall === null even though
+  // pricePerKB still falls back to the on-chain per-KB figure.
+  // ───────────────────────────────────────────────────────────────────────
+  console.log("\n── pricePerCall: indexer path ──");
+  check("SERVED (gateway-fronted): pricePerCall === pricePerKB",
+    servedFeed && servedFeed.pricePerCall === servedFeed.pricePerKB && servedFeed.pricePerCall === 100000,
+    servedFeed);
+  check("NOT-SERVED (not gateway-fronted): pricePerCall is null (pricePerKB still on-chain fallback)",
+    notServedFeed && notServedFeed.pricePerCall === null && notServedFeed.pricePerKB === 100000,
+    notServedFeed);
+  check("GATEWAY-ONLY (always fronted): pricePerCall === pricePerKB",
+    gatewayOnlyFeed && gatewayOnlyFeed.pricePerCall === gatewayOnlyFeed.pricePerKB && gatewayOnlyFeed.pricePerCall === 5000,
+    gatewayOnlyFeed);
+
   console.log("\n── exact before/after JSON, as requested ──");
   console.log("SERVED feed (test-served) full JSON:");
   console.log(JSON.stringify(servedFeed, null, 2));
@@ -236,6 +253,11 @@ async function main() {
   check("fallback path: not-served feed purchasable=false, NO mcp, NO x402",
     fbNotServed && fbNotServed.purchasable === false && !("mcp" in fbNotServed.endpoints) && !("x402" in fbNotServed.endpoints),
     fbNotServed);
+  check("fallback path: pricePerCall === pricePerKB (gateway-fronted)",
+    fbServed && fbServed.pricePerCall === fbServed.pricePerKB && fbServed.pricePerCall === 100000,
+    fbServed);
+  check("fallback path: pricePerCall is null (not gateway-fronted)",
+    fbNotServed && fbNotServed.pricePerCall === null, fbNotServed);
 
   // ───────────────────────────────────────────────────────────────────────
   // Section 4: mixed-case gateway topic (FD LOW, 2026-08-04). x402Topics/

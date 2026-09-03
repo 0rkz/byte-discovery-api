@@ -25,7 +25,15 @@ const client = createPublicClient({
 export interface Feed {
   publisher: string;
   topic: string;
+  /** @deprecated DEPRECATED (misnamed): for gateway-fronted feeds this is
+   *  the per-call price in µUSDC, identical to pricePerCall. Use
+   *  pricePerCall. Removed next release. */
   pricePerKB: number; // µUSDC (6 decimals)
+  /** The price of ONE call, in atomic µUSDC (6 decimals) — identical to the
+   *  gateway's `priceAtomic` for gateway-fronted feeds. `null` when this
+   *  feed is not fronted by the x402 gateway (no enforced per-call price
+   *  exists to report). */
+  pricePerCall: number | null;
   frequencySeconds: number;
   subscribers: number;
   messages: number;
@@ -163,7 +171,14 @@ async function fetchFromIndexer(path: string): Promise<any> {
 /** A feed as advertised by the x402 gateway's `/feeds` catalog. */
 interface GatewayFeed {
   topic: string; // lowercased slug (gateway `id`/`topic`)
+  /** @deprecated DEPRECATED (misnamed): for gateway-fronted feeds this is
+   *  the per-call price in µUSDC, identical to pricePerCall. Use
+   *  pricePerCall. Removed next release. */
   pricePerKB: number; // µUSDC (gateway `priceAtomic`)
+  /** The price of ONE call, in atomic µUSDC (6 decimals) — the gateway's
+   *  `priceAtomic`. Every GatewayFeed is, by construction, gateway-fronted,
+   *  so this is never null here. */
+  pricePerCall: number;
   provenance: string; // gateway-advertised data provenance
 }
 
@@ -187,9 +202,11 @@ async function fetchX402Feeds(): Promise<GatewayFeed[]> {
       .map((f: any): GatewayFeed | null => {
         const topic = normalizeTopic((f.topic ?? f.id ?? "").toString());
         if (!topic) return null;
+        const priceAtomic = Number(f.priceAtomic ?? f.pricePerKB ?? 0) || 0;
         return {
           topic,
-          pricePerKB: Number(f.priceAtomic ?? f.pricePerKB ?? 0) || 0,
+          pricePerKB: priceAtomic,
+          pricePerCall: priceAtomic,
           provenance: (f.provenance ?? "").toString() || "first-party",
         };
       })
@@ -401,6 +418,12 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
         pricePerKB:
           gatewayByTopic.get(normalizeTopic(onChain.topic))?.pricePerKB ??
           onChain.pricePerKB,
+        // Gateway priceAtomic when this feed is gateway-fronted, else null —
+        // never the on-chain per-KB figure onChain.pricePerKB falls back to
+        // above: a per-KB number must never appear under the per-call name.
+        pricePerCall:
+          gatewayByTopic.get(normalizeTopic(onChain.topic))?.pricePerCall ??
+          null,
         frequencySeconds: onChain.frequencySeconds,
         subscribers: onChain.subscribers,
         messages: onChain.messages,
@@ -451,6 +474,12 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
             pricePerKB:
               gatewayByTopic.get(normalizeTopic(onChain.topic))?.pricePerKB ??
               onChain.pricePerKB,
+            // See the identical resolution in the indexer-driven path above:
+            // gateway priceAtomic when fronted, else null — never the
+            // on-chain per-KB fallback that pricePerKB above uses.
+            pricePerCall:
+              gatewayByTopic.get(normalizeTopic(onChain.topic))
+                ?.pricePerCall ?? null,
             frequencySeconds: onChain.frequencySeconds,
             subscribers: onChain.subscribers,
             messages: onChain.messages,
@@ -525,6 +554,9 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
       // applied consistently to the field it names as an identity.
       topic: normalizeTopic(gf.topic),
       pricePerKB: gf.pricePerKB,
+      // This merge only runs for topics IN gatewayFeeds (loop guard above),
+      // so gf.pricePerCall is always defined here — always gateway-fronted.
+      pricePerCall: gf.pricePerCall,
       frequencySeconds: 0,
       subscribers: 0,
       messages: 0,
