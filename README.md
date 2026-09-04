@@ -228,8 +228,8 @@ What happens instead:
 | Situation | Response |
 |---|---|
 | Every read succeeded | 200, normal body. `degraded`, `degradedReason` and `lastGoodAt` are **absent** |
-| A read failed, a previous good catalog exists | 200, the **last good** catalog plus the three fields below |
-| A read failed, no good catalog yet (e.g. just restarted) | **503** with `Retry-After: 10` and `{ "error": "gateway catalog unavailable", "degraded": true, "degradedReason": "…" }` |
+| A read failed, a previous good catalog exists and is younger than `LAST_GOOD_MAX_AGE_MS` | 200, the **last good** catalog plus the three fields below |
+| A read failed, no good catalog yet (e.g. just restarted) — or the last good one is **older than `LAST_GOOD_MAX_AGE_MS`** | **503** with `Retry-After: 10` and `{ "error": "gateway catalog unavailable", "degraded": true, "degradedReason": "…" }` |
 
 Fields present only on a degraded response:
 
@@ -241,14 +241,36 @@ A degraded body carries real prices that were correct at `lastGoodAt` — not
 placeholders and not guesses. Treat the enforced 402 price as authoritative,
 and do not read a feed's absence as a delisting while `degraded` is set.
 
+A degraded body is served for at most `LAST_GOOD_MAX_AGE_MS` (default 15
+minutes) after `lastGoodAt`; past that the routes answer 503 rather than
+disclose prices that are too old to act on. A degraded body already in the
+catalog cache can still be served for up to one `CATALOG_CACHE_TTL_MS` beyond
+that age.
+
+A 503 with no last-good catalog is remembered for `CATALOG_FAILURE_CACHE_MS`
+(default 2 s): requests inside that window get the same 503 without another
+upstream attempt, so a cold start inside a gateway rate-limit window does not
+spend one gateway fetch per incoming request.
+
 ### Environment
 
 | Variable | Default | What it does |
 |---|---|---|
 | `X402_GATEWAY` | `http://localhost:3402` | The gateway base **advertised to agents**. Must stay publicly resolvable. |
 | `X402_GATEWAY_FETCH` | same as `X402_GATEWAY` | Base used **only** for the server's own `/feeds` fetch. Point it at loopback to keep that fetch off the public rate limit; nothing agents see changes. |
-| `GATEWAY_FETCH_TIMEOUT_MS` | `5000` | Deadline for the server's outbound fetches. |
-| `CATALOG_CACHE_TTL_MS` | `10000` | How long one assembled catalog is reused. Concurrent requests share a single assembly. |
+| `GATEWAY_FETCH_TIMEOUT_MS` | `5000` | Deadline for the server's outbound fetches. Must be ≥ 1. |
+| `CATALOG_CACHE_TTL_MS` | `10000` | How long one assembled catalog is reused. Concurrent requests share a single assembly. `0` turns the cache off. |
+| `LAST_GOOD_MAX_AGE_MS` | `900000` (15 min) | Oldest last-good catalog that is still served as `degraded`. Older → 503. Must be ≥ 1. |
+| `CATALOG_FAILURE_CACHE_MS` | `2000` | How long a no-last-good 503 is re-served without retrying the upstreams. `0` turns it off. |
+
+Each of the four `*_MS` values must be a finite number of milliseconds at or
+above its floor. An empty value means "not set" (the default applies
+silently); anything else that does not parse — `abc`, a negative number, a
+`0` where the floor is `1` — falls back to the default and logs one
+`[config]` line at start-up naming the variable and the value it rejected.
+Before this guard, `GATEWAY_FETCH_TIMEOUT_MS=` in a unit file became a
+timeout of `0`, which aborted every fetch and turned the service into a
+permanent 503.
 
 ### Checking it
 
@@ -256,6 +278,8 @@ and do not read a feed's absence as a delisting while `degraded` is set.
 scripts/probe-discover-concurrent.sh http://127.0.0.1:3500 60 10
 ```
 
-Sends 60 requests at concurrency 10 and exits non-zero if any 200 carries a
-non-modal or degraded catalog. A sequential check does not catch this class:
-the broken build passed one ~90% of the time.
+Sends 60 requests at concurrency 10 (bash; the throttle is `xargs -P`, a hard
+cap) and prints the count of 200s and 503s. Exit `1` if any 200 carries a non-modal or
+degraded catalog; exit `2` if no response was a 200 at all (down, or failing
+closed — either way there is no catalog to judge). A sequential check does
+not catch the first class: the broken build passed one ~90% of the time.

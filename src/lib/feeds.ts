@@ -837,6 +837,10 @@ let servedAt = 0;
 let lastResult: DiscoveryResponse | null = null;
 /** The in-flight assembly, shared by every concurrent caller. */
 let inFlight: Promise<DiscoveryResponse> | null = null;
+/** The last fail-closed outcome, re-served for `catalogFailureCacheMs`. */
+let lastFailure: CatalogUnavailableError | null = null;
+/** Epoch ms of `lastFailure`. */
+let failedAt = 0;
 
 /** Test seam: drop all cached state. Not used in production paths. */
 export function __resetCatalogCacheForTests(): void {
@@ -846,6 +850,16 @@ export function __resetCatalogCacheForTests(): void {
   servedAt = 0;
   lastResult = null;
   inFlight = null;
+  lastFailure = null;
+  failedAt = 0;
+}
+
+/**
+ * Test seam: observe cache state that has no production-visible effect on its
+ * own (whether a cleared failure is really gone). Not used in production paths.
+ */
+export function __catalogStateForTests(): { hasLastFailure: boolean; hasLastGood: boolean } {
+  return { hasLastFailure: lastFailure !== null, hasLastGood: lastGood !== null };
 }
 
 /** Human-readable age, e.g. "41s". */
@@ -860,7 +874,9 @@ function ageSeconds(sinceMs: number): string {
  * three outcomes are:
  *   1. every read succeeded          → fresh catalog, cached, becomes last-good
  *   2. a read failed, last-good held → last-good + `degraded` disclosure
+ *      (only while the last-good is younger than `lastGoodMaxAgeMs`)
  *   3. a read failed, nothing held   → CatalogUnavailableError (→ 503)
+ *      (also when the last-good is too old to disclose honestly)
  */
 async function refreshCatalog(): Promise<DiscoveryResponse> {
   const { response, incomplete } = await assembleCatalog();
@@ -877,6 +893,19 @@ async function refreshCatalog(): Promise<DiscoveryResponse> {
     lastGoodMs = Date.now();
     lastGoodAt = new Date(lastGoodMs).toISOString();
     return response;
+  }
+
+  if (lastGood && Date.now() - lastGoodMs > config.lastGoodMaxAgeMs) {
+    // Prices that were right a few minutes ago are a fair, labelled answer;
+    // prices from this morning are not. Past the max age the honest answer
+    // is "unavailable", and the last-good is kept only so that a recovery
+    // still passes the shrink check above.
+    console.error(
+      `[discover] upstream FAILED (${incomplete}) — last-good catalog from ${lastGoodAt} is ${ageSeconds(lastGoodMs)} old, past LAST_GOOD_MAX_AGE_MS=${config.lastGoodMaxAgeMs}; answering 503`,
+    );
+    throw new CatalogUnavailableError(
+      `${incomplete}; last-good catalog from ${lastGoodAt} is older than ${config.lastGoodMaxAgeMs} ms`,
+    );
   }
 
   if (lastGood) {
@@ -912,14 +941,32 @@ export async function getFeeds(): Promise<DiscoveryResponse> {
   if (lastResult && Date.now() - servedAt < config.catalogTtlMs) {
     return lastResult;
   }
+  // The fail-closed outcome is cached too, briefly. Single-flight bounds how
+  // many callers share one assembly, not how often sequential callers start
+  // a new one: a cold process inside a gateway rate-limit window would
+  // otherwise spend one upstream fetch per request on answers it already
+  // knows are 503.
+  if (lastFailure && Date.now() - failedAt < config.catalogFailureCacheMs) {
+    throw lastFailure;
+  }
   if (inFlight) return inFlight;
 
   inFlight = refreshCatalog()
-    .then((res) => {
-      lastResult = res;
-      servedAt = Date.now();
-      return res;
-    })
+    .then(
+      (res) => {
+        lastResult = res;
+        servedAt = Date.now();
+        lastFailure = null;
+        return res;
+      },
+      (err) => {
+        if (err instanceof CatalogUnavailableError) {
+          lastFailure = err;
+          failedAt = Date.now();
+        }
+        throw err;
+      },
+    )
     .finally(() => {
       inFlight = null;
     });

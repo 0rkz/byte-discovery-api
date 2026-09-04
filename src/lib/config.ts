@@ -11,6 +11,29 @@ dotenv.config();
  */
 const X402_GATEWAY = process.env.X402_GATEWAY || "http://localhost:3402";
 
+/**
+ * Read a millisecond setting from the environment.
+ *
+ * Unset or empty → the default, silently (an empty `KEY=` line in .env is
+ * how dotenv spells "not set"). Anything else must parse to a finite number
+ * of at least `floor`; otherwise the default is used and ONE line says so.
+ * `Number("")` is 0 and `Number("abc")` is NaN, and before this guard both
+ * flowed straight into `AbortSignal.timeout()` — a timeout of 0 aborts every
+ * fetch, which turns a typo in the unit file into a permanent 503.
+ */
+function envMs(name: string, fallback: number, floor: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < floor) {
+    console.error(
+      `[config] ${name}=${JSON.stringify(raw)} is not a finite number >= ${floor}; using default ${fallback}`,
+    );
+    return fallback;
+  }
+  return n;
+}
+
 /** Runtime configuration loaded from environment variables with sensible defaults. */
 export const config = {
   port: parseInt(process.env.PORT || "3500", 10),
@@ -38,7 +61,7 @@ export const config = {
    * Without one, a hung upstream holds a /discover request open until the
    * client gives up, and concurrent requests pile onto the same upstream.
    */
-  gatewayFetchTimeoutMs: Number(process.env.GATEWAY_FETCH_TIMEOUT_MS ?? 5000),
+  gatewayFetchTimeoutMs: envMs("GATEWAY_FETCH_TIMEOUT_MS", 5000, 1),
 
   /**
    * How long an assembled catalog stays fresh. Every /discover previously did
@@ -46,7 +69,26 @@ export const config = {
    * itself; one shared catalog per window removes that. Also bounds how stale
    * a `degraded` last-good response can be.
    */
-  catalogTtlMs: Number(process.env.CATALOG_CACHE_TTL_MS ?? 10_000),
+  catalogTtlMs: envMs("CATALOG_CACHE_TTL_MS", 10_000, 0),
+
+  /**
+   * How old a last-good catalog may be and still be served (labelled
+   * `degraded`) while an upstream read keeps failing. Past this age the
+   * catalog routes answer 503 instead: prices that were right 15 minutes ago
+   * are a fair disclosure, prices from this morning are not. A degraded body
+   * already cached can still be served for up to one CATALOG_CACHE_TTL_MS
+   * past this age.
+   */
+  lastGoodMaxAgeMs: envMs("LAST_GOOD_MAX_AGE_MS", 15 * 60_000, 1),
+
+  /**
+   * How long a failed assembly with NOTHING to fall back on (the 503 path)
+   * is remembered before the next request tries the upstreams again.
+   * Without it a cold start inside a gateway rate-limit window re-attempts
+   * one gateway fetch per request — single-flight bounds concurrency, not
+   * the sequential rate. 0 disables it (tests).
+   */
+  catalogFailureCacheMs: envMs("CATALOG_FAILURE_CACHE_MS", 2_000, 0),
 
   chainId: 421614,
   chain: "arbitrum-sepolia",

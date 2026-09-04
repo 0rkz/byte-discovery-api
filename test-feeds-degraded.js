@@ -84,20 +84,59 @@ Object.defineProperty(viemModule, "createPublicClient", {
 });
 
 // ── fetch mock ─────────────────────────────────────────────────────────────
-let gatewayMode = "ok";      // ok | status | throw | hang
+let gatewayMode = "ok";      // ok | status | throw | hang | body
 let gatewayStatus = 429;
+let gatewayBody = null;      // served verbatim as the 2xx JSON when mode is "body"
 let gatewayFeeds = [];
 let indexerPublishers = null;
+let indexerMode = "ok";      // ok | hang
 let gatewayCalls = [];       // every URL the gateway fetch was called with
+
+// A fetch that settles ONLY when its signal aborts — the shape of a hung
+// upstream. With no signal at all it never settles, which is exactly what a
+// build that forgot the AbortSignal would do in production; the test around
+// it must then time out rather than pass by accident.
+function hangUntilAbort(opts) {
+  return new Promise((_resolve, reject) => {
+    if (!opts || !opts.signal) return;
+    opts.signal.addEventListener("abort", () => {
+      const e = new Error("The operation was aborted due to timeout");
+      e.name = "TimeoutError";
+      reject(e);
+    });
+  });
+}
+
+// A real fetch is asynchronous, so a signal that fires "immediately" still
+// beats the response. The ok-mode mock answers after one short macrotask and
+// then honours an aborted signal. Without this, a 0 ms timeout and a 5 s one
+// were indistinguishable to the suite, and T14's live check passed on the
+// unguarded build (VER L2).
+async function respectAbort(opts) {
+  await new Promise((r) => setTimeout(r, 5));
+  if (opts && opts.signal && opts.signal.aborted) {
+    const e = new Error("The operation was aborted due to timeout");
+    e.name = "TimeoutError";
+    throw e;
+  }
+}
+
+// A rejected recovery must fail a CHECK, never crash the runner (VER L4).
+async function settle(promise) {
+  try { return { res: await promise, err: null }; } catch (err) { return { res: null, err }; }
+}
 
 global.fetch = async (url, opts) => {
   if (String(url).includes("/publishers?limit=200")) {
+    if (indexerMode === "hang") return hangUntilAbort(opts);
     if (indexerPublishers === null) return { ok: false, status: 503 };
+    await respectAbort(opts);
     return { ok: true, status: 200, json: async () => indexerPublishers };
   }
   if (String(url).endsWith("/feeds")) {
     gatewayCalls.push(String(url));
     if (gatewayMode === "status") return { ok: false, status: gatewayStatus };
+    if (gatewayMode === "body") return { ok: true, status: 200, json: async () => gatewayBody };
     if (gatewayMode === "throw") throw new TypeError("fetch failed");
     if (gatewayMode === "hang") {
       return new Promise((_resolve, reject) => {
@@ -108,6 +147,7 @@ global.fetch = async (url, opts) => {
         });
       });
     }
+    await respectAbort(opts);
     return { ok: true, status: 200, json: async () => ({ feeds: gatewayFeeds }) };
   }
   throw new Error(`mock fetch: unhandled URL ${url}`);
@@ -124,6 +164,8 @@ function loadFeeds(env = {}) {
     GATEWAY_FETCH_TIMEOUT_MS: "5000",
     X402_GATEWAY: "https://x402.payperbyte.io",
     X402_GATEWAY_FETCH: "",
+    LAST_GOOD_MAX_AGE_MS: "",
+    CATALOG_FAILURE_CACHE_MS: "0",
   };
   for (const [k, v] of Object.entries({ ...defaults, ...env })) {
     if (v === "") delete process.env[k];
@@ -133,6 +175,17 @@ function loadFeeds(env = {}) {
   delete require.cache[FEEDS];
   delete require.cache[HTTP_ERRORS];
   return require(FEEDS);
+}
+
+// Config alone, with the environment set EXACTLY as given — an empty string
+// stays an empty string here (dotenv spells an unset `KEY=` line that way),
+// which loadFeeds() above deliberately turns into "unset".
+const MS_VARS = ["GATEWAY_FETCH_TIMEOUT_MS", "CATALOG_CACHE_TTL_MS", "LAST_GOOD_MAX_AGE_MS", "CATALOG_FAILURE_CACHE_MS"];
+function loadConfig(env = {}) {
+  for (const k of MS_VARS) delete process.env[k];
+  for (const [k, v] of Object.entries(env)) process.env[k] = String(v);
+  delete require.cache[CONFIG];
+  return require(CONFIG).config;
 }
 
 // A 3-feed on-chain fixture plus a gateway that fronts all three.
@@ -155,6 +208,8 @@ function fixture(n = 3) {
   schemaRejectsFor = null;
   listLengthThrows = false;
   gatewayMode = "ok";
+  gatewayBody = null;
+  indexerMode = "ok";
   gatewayCalls = [];
 }
 
@@ -220,6 +275,37 @@ async function run() {
   check("no last-good: error carries a reason naming the status",
     threw && /429/.test(threw.reason || ""), threw && threw.reason);
 
+  // ── T2c: a 2xx whose body is JSON but not a catalog is a FAILURE ────────
+  // Pins the `Array.isArray(data?.feeds)` half of "good". A build that read
+  // a non-array as [] would serve the on-chain-only set at 200 — the very
+  // fail-open this change removed, reachable through a JSON error page.
+  console.log("\n── T2c: gateway 2xx with a {} body ──");
+  fixture();
+  m = loadFeeds();
+  gatewayMode = "body";
+  gatewayBody = {};
+  let bodyErr = null;
+  let bodyRes = null;
+  try { bodyRes = await m.getFeeds(); } catch (e) { bodyErr = e; }
+  check("{} body, cold: rejected — a JSON-but-not-a-catalog 2xx is not an empty catalog",
+    bodyErr !== null && bodyRes === null, bodyRes && bodyRes.totalFeeds);
+  check("{} body, cold: CatalogUnavailableError",
+    bodyErr && bodyErr.name === "CatalogUnavailableError", bodyErr && bodyErr.name);
+  check("{} body, cold: reason says the body is malformed",
+    bodyErr && /malformed/.test(bodyErr.reason || ""), bodyErr && bodyErr.reason);
+
+  fixture();
+  m = loadFeeds();
+  const beforeBody = await m.getFeeds();
+  gatewayMode = "body";
+  gatewayBody = { feeds: "not an array" };
+  const { res: afterBody, err: afterBodyErr } = await settle(m.getFeeds());
+  check("non-array feeds, warm: last-good served and labelled degraded — never a 0-feed 200",
+    afterBody && afterBody.degraded === true && sameFeeds(afterBody.feeds, beforeBody.feeds),
+    afterBody ? afterBody.totalFeeds : afterBodyErr && afterBodyErr.reason);
+  check("non-array feeds, warm: prices still the gateway's (not re-priced from the chain)",
+    afterBody && afterBody.feeds.every((f) => f.pricePerCall !== null));
+
   // ── T3: hung gateway aborts on the timeout ──────────────────────────────
   console.log("\n── T3: gateway hangs, AbortSignal.timeout fires ──");
   fixture();
@@ -232,6 +318,28 @@ async function run() {
   check("hang: rejected rather than hanging forever", timeoutErr !== null);
   check(`hang: returned within 1500 ms (took ${elapsed} ms)`, elapsed < 1500);
   check("hang: reason says timeout", timeoutErr && /timeout/i.test(timeoutErr.reason || ""), timeoutErr && timeoutErr.reason);
+
+  // ── T3b: hung INDEXER aborts on the timeout; the chain fallback answers ──
+  // Pins the AbortSignal on fetchFromIndexer. Without it a hung indexer holds
+  // every /discover open until the client gives up. The race below is what
+  // turns "hangs forever" into a failed check instead of a hung suite.
+  console.log("\n── T3b: indexer hangs, AbortSignal.timeout fires, chain fallback answers ──");
+  fixture();
+  m = loadFeeds({ GATEWAY_FETCH_TIMEOUT_MS: "200" });
+  indexerMode = "hang";
+  const t1 = Date.now();
+  let raceTimer = null;
+  const raced = await Promise.race([
+    m.getFeeds().catch((e) => e),
+    new Promise((r) => { raceTimer = setTimeout(r, 3000, "HUNG"); }),
+  ]);
+  clearTimeout(raceTimer);
+  const elapsedIdx = Date.now() - t1;
+  indexerMode = "ok";
+  check("indexer hang: getFeeds settled instead of hanging", raced !== "HUNG");
+  check(`indexer hang: settled within 1500 ms (took ${elapsedIdx} ms)`, elapsedIdx < 1500);
+  check("indexer hang: a full catalog came from the chain fallback, not degraded",
+    raced && raced.totalFeeds === 3 && !("degraded" in raced), raced && (raced.totalFeeds ?? raced.name));
 
   // ── T4: fetch throws ────────────────────────────────────────────────────
   console.log("\n── T4: gateway fetch throws ──");
@@ -343,6 +451,121 @@ async function run() {
   check("shrink: served as good — 'degraded' ABSENT", !("degraded" in small));
   check("shrink: one journal line records it",
     logged.some((l) => /shrank 4 -> 1/.test(l)), logged);
+
+  // ── T12: a last-good older than LAST_GOOD_MAX_AGE_MS is not served ─────
+  console.log("\n── T12: last-good older than LAST_GOOD_MAX_AGE_MS → 503 ──");
+  fixture();
+  m = loadFeeds({ LAST_GOOD_MAX_AGE_MS: "100" });
+  const freshMax = await m.getFeeds();
+  gatewayMode = "status";
+  gatewayStatus = 429;
+  const young = await m.getFeeds();
+  check("max-age: inside the window the last-good is served, labelled degraded",
+    young.degraded === true && sameFeeds(young.feeds, freshMax.feeds), young.degraded);
+  await new Promise((r) => setTimeout(r, 150));
+  let oldErr = null;
+  let oldRes = null;
+  try { oldRes = await m.getFeeds(); } catch (e) { oldErr = e; }
+  check("max-age: past the window the route fails closed, no stale 200",
+    oldErr !== null && oldRes === null, oldRes && oldRes.lastGoodAt);
+  check("max-age: CatalogUnavailableError", oldErr && oldErr.name === "CatalogUnavailableError", oldErr && oldErr.name);
+  check("max-age: reason carries the upstream cause AND the age",
+    oldErr && /429/.test(oldErr.reason || "") && /older than 100 ms/.test(oldErr.reason || ""), oldErr && oldErr.reason);
+  gatewayMode = "ok";
+  const { res: recovered, err: recoveredErr } = await settle(m.getFeeds());
+  check("max-age: a healthy upstream afterwards serves a fresh, clean catalog",
+    recovered && recovered.totalFeeds === 3 && !("degraded" in recovered),
+    recovered ? recovered.totalFeeds : recoveredErr && recoveredErr.reason);
+
+  // ── T13: the cold 503 is remembered for CATALOG_FAILURE_CACHE_MS ───────
+  console.log("\n── T13: negative cache on the cold-503 path ──");
+  fixture();
+  m = loadFeeds({ CATALOG_FAILURE_CACHE_MS: "150" });
+  gatewayMode = "status";
+  gatewayStatus = 429;
+  let cold1 = null;
+  try { await m.getFeeds(); } catch (e) { cold1 = e; }
+  const callsAfterCold = gatewayCalls.length;
+  gatewayMode = "ok"; // the upstream is healthy again at once — the cache must still answer
+  let cold2 = null;
+  try { await m.getFeeds(); } catch (e) { cold2 = e; }
+  check("neg-cache: first cold call fails closed", cold1 && cold1.name === "CatalogUnavailableError", cold1 && cold1.name);
+  check("neg-cache: a call inside the window is answered from memory — no upstream fetch",
+    cold2 && cold2.name === "CatalogUnavailableError" && gatewayCalls.length === callsAfterCold,
+    { err: cold2 && cold2.name, calls: gatewayCalls.length });
+  check("neg-cache: the remembered reason is the observed one", cold2 && /429/.test(cold2.reason || ""), cold2 && cold2.reason);
+  await new Promise((r) => setTimeout(r, 200));
+  const { res: afterWindow, err: afterWindowErr } = await settle(m.getFeeds());
+  check("neg-cache: after the window the upstream is tried again and a fresh catalog served",
+    afterWindow && afterWindow.totalFeeds === 3 && !("degraded" in afterWindow) && gatewayCalls.length === callsAfterCold + 1,
+    afterWindow ? gatewayCalls.length : afterWindowErr && afterWindowErr.reason);
+  check("neg-cache: the good result CLEARS the remembered failure (seam)",
+    m.__catalogStateForTests().hasLastFailure === false, m.__catalogStateForTests());
+  gatewayMode = "status";
+  const { res: laterFail, err: laterFailErr } = await settle(m.getFeeds());
+  check("neg-cache: a later failure serves degraded last-good, not the old 503",
+    laterFail && laterFail.degraded === true && sameFeeds(laterFail.feeds, afterWindow.feeds),
+    laterFail ? laterFail.degraded : laterFailErr && laterFailErr.reason);
+
+  fixture();
+  m = loadFeeds({ CATALOG_FAILURE_CACHE_MS: "1000" });
+  gatewayMode = "status";
+  for (let i = 0; i < 5; i++) { try { await m.getFeeds(); } catch (_) { /* expected */ } }
+  check("neg-cache: 5 sequential cold calls inside the window cost ONE gateway fetch",
+    gatewayCalls.length === 1, gatewayCalls.length);
+
+  fixture();
+  m = loadFeeds({ CATALOG_FAILURE_CACHE_MS: "0" });
+  gatewayMode = "status";
+  for (let i = 0; i < 3; i++) { try { await m.getFeeds(); } catch (_) { /* expected */ } }
+  check("neg-cache: 0 disables it — every cold call retries the upstream", gatewayCalls.length === 3, gatewayCalls.length);
+
+  // ── T14: env values that cannot be a deadline fall back, loudly ────────
+  console.log("\n── T14: env parse guard ──");
+  const guardLines = [];
+  const realErrGuard = console.error;
+  console.error = (...a) => guardLines.push(a.join(" "));
+  const cUnset = loadConfig({});
+  const cEmpty = loadConfig({ GATEWAY_FETCH_TIMEOUT_MS: "" });
+  const linesAfterEmpty = guardLines.length;
+  const cWs = loadConfig({ GATEWAY_FETCH_TIMEOUT_MS: "  " });
+  const linesAfterWs = guardLines.length;
+  const cAbc = loadConfig({ GATEWAY_FETCH_TIMEOUT_MS: "abc" });
+  const linesAfterAbc = guardLines.length;
+  const cZero = loadConfig({ GATEWAY_FETCH_TIMEOUT_MS: "0" });
+  const cNeg = loadConfig({ LAST_GOOD_MAX_AGE_MS: "-5", CATALOG_FAILURE_CACHE_MS: "-1" });
+  const cOk = loadConfig({ GATEWAY_FETCH_TIMEOUT_MS: "250", CATALOG_CACHE_TTL_MS: "0", LAST_GOOD_MAX_AGE_MS: "60000", CATALOG_FAILURE_CACHE_MS: "0" });
+  console.error = realErrGuard;
+  check("guard: defaults are 5000 / 10000 / 900000 / 2000",
+    cUnset.gatewayFetchTimeoutMs === 5000 && cUnset.catalogTtlMs === 10000 &&
+    cUnset.lastGoodMaxAgeMs === 900000 && cUnset.catalogFailureCacheMs === 2000,
+    [cUnset.gatewayFetchTimeoutMs, cUnset.catalogTtlMs, cUnset.lastGoodMaxAgeMs, cUnset.catalogFailureCacheMs]);
+  check("guard: GATEWAY_FETCH_TIMEOUT_MS=\"\" → default, silently (dotenv's unset)",
+    cEmpty.gatewayFetchTimeoutMs === 5000 && linesAfterEmpty === 0, [cEmpty.gatewayFetchTimeoutMs, linesAfterEmpty]);
+  check("guard: whitespace-only value → default, silently (Number(\"  \") would be 0)",
+    cWs.gatewayFetchTimeoutMs === 5000 && linesAfterWs === 0, [cWs.gatewayFetchTimeoutMs, linesAfterWs]);
+  check("guard: \"abc\" → default + ONE line naming the variable and value",
+    cAbc.gatewayFetchTimeoutMs === 5000 && linesAfterAbc === 1 && /GATEWAY_FETCH_TIMEOUT_MS="abc"/.test(guardLines[0] || ""),
+    guardLines);
+  check("guard: \"0\" is not a deadline → default (0 aborted every fetch)", cZero.gatewayFetchTimeoutMs === 5000, cZero.gatewayFetchTimeoutMs);
+  check("guard: negative max-age / failure-cache → defaults",
+    cNeg.lastGoodMaxAgeMs === 900000 && cNeg.catalogFailureCacheMs === 2000, [cNeg.lastGoodMaxAgeMs, cNeg.catalogFailureCacheMs]);
+  check("guard: valid values pass through; CATALOG_CACHE_TTL_MS=0 (cache off) stays legal",
+    cOk.gatewayFetchTimeoutMs === 250 && cOk.catalogTtlMs === 0 && cOk.lastGoodMaxAgeMs === 60000 && cOk.catalogFailureCacheMs === 0,
+    [cOk.gatewayFetchTimeoutMs, cOk.catalogTtlMs, cOk.lastGoodMaxAgeMs, cOk.catalogFailureCacheMs]);
+  check("guard: one line per bad value, none for good ones", guardLines.length === 4, guardLines.length);
+
+  // the guard's live effect: a 0 timeout in the unit no longer means permanent 503
+  fixture();
+  const realErrLive = console.error;
+  console.error = () => {};
+  m = loadFeeds({ GATEWAY_FETCH_TIMEOUT_MS: "0" });
+  let liveErr = null;
+  let liveRes = null;
+  try { liveRes = await m.getFeeds(); } catch (e) { liveErr = e; }
+  console.error = realErrLive;
+  check("guard, live: GATEWAY_FETCH_TIMEOUT_MS=0 still assembles a catalog (fetches are not aborted at once)",
+    liveErr === null && liveRes && liveRes.totalFeeds === 3 && !("degraded" in liveRes), liveErr && liveErr.reason);
 
   // ── 503 contract at the HTTP layer, via the shared helper ──────────────
   console.log("\n── 503 helper: the contract all five routes use ──");
